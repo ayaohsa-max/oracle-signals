@@ -12,7 +12,7 @@
 #include <Trade\Trade.mqh>
 
 //--- Réglages
-input string InpSignalURL       = "";                   // Adresse web du fichier de consignes (vide = fichier local)
+input string InpSignalURL       = "https://raw.githubusercontent.com/ayaohsa-max/oracle-signals/main/oracle_signals.csv";                   // Adresse web du fichier de consignes (vide = fichier local)
 input string InpLocalFile       = "oracle_signals.csv"; // Fichier local (dossier MQL5\Files)
 input int    InpPollSeconds     = 60;                   // Lecture des consignes toutes les N secondes
 input bool   InpDemoOnly        = false;                // true = refuser de trader sur un compte réel
