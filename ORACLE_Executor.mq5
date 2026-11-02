@@ -3,10 +3,10 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.02 – comptes démo et réel                             |
+//|  Version 1.03 – comptes démo et réel                             |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.02"
+#property version   "1.03"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -460,6 +460,21 @@ ENUM_ORDER_TYPE OrderTypeOf(OSignal &s)
   }
 
 //+------------------------------------------------------------------+
+//| Envoi d'un ordre en attente, confirmé par le serveur             |
+//+------------------------------------------------------------------+
+bool SendPending(string sym, ENUM_ORDER_TYPE ot, double lot, double price, double sl, double tp, long magic, string comment)
+  {
+   g_trade.SetExpertMagicNumber(magic);
+   g_trade.SetTypeFillingBySymbol(sym);
+   long expMode = SymbolInfoInteger(sym, SYMBOL_EXPIRATION_MODE);
+   ENUM_ORDER_TYPE_TIME tt = ((expMode & SYMBOL_EXPIRATION_GTC) != 0) ? ORDER_TIME_GTC : ORDER_TIME_DAY;
+   if(!g_trade.OrderOpen(sym, ot, lot, 0, price, sl, tp, tt, 0, comment))
+      return false;
+   uint rc = g_trade.ResultRetcode();
+   return (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED);
+  }
+
+//+------------------------------------------------------------------+
 //| Pose d'une idée                                                  |
 //+------------------------------------------------------------------+
 void PlaceSignal(OSignal &s)
@@ -529,17 +544,12 @@ void PlaceSignal(OSignal &s)
       return;
      }
 
-   bool ok = true;
-   g_trade.SetExpertMagicNumber(MakeMagic(idnum, 1));
-   ok = g_trade.OrderOpen(sym, ot, lotA, 0, e, sl, t1, ORDER_TIME_GTC, 0, "ORACLE " + s.id + " A");
+   bool ok = SendPending(sym, ot, lotA, e, sl, t1, MakeMagic(idnum, 1), "ORACLE " + s.id + " A");
    if(ok && lotB > 0)
-     {
-      g_trade.SetExpertMagicNumber(MakeMagic(idnum, 2));
-      ok = g_trade.OrderOpen(sym, ot, lotB, 0, e, sl, t2, ORDER_TIME_GTC, 0, "ORACLE " + s.id + " B");
-     }
+      ok = SendPending(sym, ot, lotB, e, sl, t2, MakeMagic(idnum, 2), "ORACLE " + s.id + " B");
    if(!ok)
      {
-      Print("ORACLE : ", s.id, " refus du courtier : ", g_trade.ResultRetcodeDescription());
+      Print("ORACLE : ", s.id, " refus du courtier : ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
       DeletePending("échec de pose", idnum);
       return;
      }
@@ -620,8 +630,14 @@ void ManageBreakEven()
 //+------------------------------------------------------------------+
 //| Boucle principale                                                |
 //+------------------------------------------------------------------+
+string LockName() { return "ORACLE_LOCK_" + IntegerToString(InpMagic); }
+string BeatName() { return "ORACLE_BEAT_" + IntegerToString(InpMagic); }
+double ChartKey() { return (double)(ChartID() % 1000000007); }  // tient sans perte dans un double
+
 void Cycle()
   {
+   GlobalVariableSet(LockName(), ChartKey());
+   GlobalVariableSet(BeatName(), (double)TimeLocal());
    if(InpDemoOnly && TerminalInfoInteger(TERMINAL_CONNECTED) && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
      {
       Comment("ORACLE : compte RÉEL détecté, robot à l'arrêt (réglage « Démo uniquement »).");
@@ -664,7 +680,7 @@ void Cycle()
          PlaceSignal(g_sig[i]);
         }
 
-   Comment(StringFormat("ORACLE Executor v1.02 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | %s",
+   Comment(StringFormat("ORACLE Executor v1.03 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
@@ -673,10 +689,18 @@ void Cycle()
 
 int OnInit()
   {
+   // Un seul robot ORACLE par MetaTrader : refuse de démarrer si un autre graphique l'exécute déjà.
+   if(GlobalVariableCheck(LockName()) && GlobalVariableGet(LockName()) != ChartKey() &&
+      GlobalVariableCheck(BeatName()) && TimeLocal() - (datetime)GlobalVariableGet(BeatName()) < 3 * MathMax(10, InpPollSeconds))
+     {
+      string msg = "ORACLE : un autre graphique exécute déjà le robot dans ce MetaTrader. Retirez l'un des deux (sinon ordres en double).";
+      Print(msg);
+      Alert(msg);
+      return INIT_FAILED;
+     }
    g_trade.SetDeviationInPoints(30);
    EventSetTimer(MathMax(10, InpPollSeconds));
-   Notify("robot démarré sur le compte " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) +
-          (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? " (démo)" : " (réel)"));
+   Notify("robot démarré (compte " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ")");
    Cycle();
    return INIT_SUCCEEDED;
   }
@@ -684,6 +708,11 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
+   if(GlobalVariableCheck(LockName()) && GlobalVariableGet(LockName()) == ChartKey())
+     {
+      GlobalVariableDel(LockName());
+      GlobalVariableDel(BeatName());
+     }
    Comment("");
   }
 
