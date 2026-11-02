@@ -3,10 +3,10 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.03 – comptes démo et réel                             |
+//|  Version 1.04 – comptes démo et réel                             |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.03"
+#property version   "1.04"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -25,6 +25,9 @@ input double InpMaxSignalAgeH   = 36;                   // Consignes plus vieill
 input bool   InpAutoAdjust      = true;                 // Recaler les niveaux spot sur le prix du courtier
 input double InpMaxAdjustPct    = 1.0;                  // Écart spot/courtier max accepté (%)
 input bool   InpBreakEven       = true;                 // Stop à l'entrée sur la 2e moitié une fois TP1 touché
+input bool   InpFridayClose     = true;                 // Fermer tout le vendredi soir et rester en pause le week-end (règle FTMO)
+input int    InpFridayHour      = 21;                   // Heure de fermeture du vendredi (heure de Paris)
+input int    InpFridayMinute    = 45;                   // Minute de fermeture du vendredi (heure de Paris)
 input bool   InpPush            = true;                 // Notifications sur l'application MT5 mobile
 input long   InpMagic           = 77;                   // Identifiant du robot (ne pas changer en cours de route)
 input string InpSymGold         = "";                   // Symbole de l'or (vide = détection auto)
@@ -630,6 +633,65 @@ void ManageBreakEven()
 //+------------------------------------------------------------------+
 //| Boucle principale                                                |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Heure de Paris (heure d'été européenne gérée)                    |
+//+------------------------------------------------------------------+
+datetime LastSundayUTC(int year, int month)
+  {
+   MqlDateTime t;
+   ZeroMemory(t);
+   t.year = (month == 12) ? year + 1 : year;
+   t.mon  = (month == 12) ? 1 : month + 1;
+   t.day  = 1;
+   datetime last = StructToTime(t) - 86400;          // dernier jour du mois, 00:00
+   MqlDateTime l;
+   TimeToStruct(last, l);
+   return last - l.day_of_week * 86400;              // dernier dimanche, 00:00 UTC
+  }
+
+datetime ParisNow()
+  {
+   datetime u = TimeGMT();
+   MqlDateTime d;
+   TimeToStruct(u, d);
+   datetime summerStart = LastSundayUTC(d.year, 3) + 3600;   // dernier dimanche de mars, 01:00 UTC
+   datetime summerEnd   = LastSundayUTC(d.year, 10) + 3600;  // dernier dimanche d'octobre, 01:00 UTC
+   return u + ((u >= summerStart && u < summerEnd) ? 7200 : 3600);
+  }
+
+// 0 = semaine normale ; 1 = vendredi après l'heure de fermeture ; 2 = samedi ou dimanche avant 23h
+int WeekendState()
+  {
+   if(!InpFridayClose) return 0;
+   MqlDateTime p;
+   TimeToStruct(ParisNow(), p);
+   int mins = p.hour * 60 + p.min, cut = InpFridayHour * 60 + InpFridayMinute;
+   if(p.day_of_week == 5 && mins >= cut) return 1;
+   if(p.day_of_week == 6) return 2;
+   if(p.day_of_week == 0 && p.hour < 23) return 2;
+   return 0;
+  }
+
+void FridayClose()
+  {
+   int open = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
+      open++;
+      g_trade.PositionClose(t);
+     }
+   MqlDateTime p;
+   TimeToStruct(ParisNow(), p);
+   string key = GV("fri_" + StringFormat("%04d%02d%02d", p.year, p.mon, p.day));
+   if(open > 0 && !GlobalVariableCheck(key))
+     {
+      GlobalVariableSet(key, 1);
+      Notify("fermeture du vendredi : " + IntegerToString(open) + " position(s) fermée(s), pause jusqu'à dimanche 23h.");
+     }
+  }
+
 string LockName() { return "ORACLE_LOCK_" + IntegerToString(InpMagic); }
 string BeatName() { return "ORACLE_BEAT_" + IntegerToString(InpMagic); }
 double ChartKey() { return (double)(ChartID() % 1000000007); }  // tient sans perte dans un double
@@ -665,7 +727,10 @@ void Cycle()
    bool ok = FetchText(txt) && Parse(txt);
    bool stale = !ok || (TimeGMT() - g_updated > (long)(InpMaxSignalAgeH * 3600));
    bool black = InBlackout();
-   string why = !ok ? "consignes illisibles" : stale ? "consignes trop anciennes" : !g_enabled ? "robot coupé par ORACLE (interrupteur)" : black ? "annonce économique" : "";
+   int wk = WeekendState();
+   if(wk == 1) FridayClose();
+   string why = (wk > 0) ? "week-end (fermeture du vendredi " + IntegerToString(InpFridayHour) + "h" + StringFormat("%02d", InpFridayMinute) + ")" :
+                !ok ? "consignes illisibles" : stale ? "consignes trop anciennes" : !g_enabled ? "robot coupé par ORACLE (interrupteur)" : black ? "annonce économique" : "";
    bool allowed = (why == "");
 
    ManagePending(allowed, why);
@@ -680,7 +745,7 @@ void Cycle()
          PlaceSignal(g_sig[i]);
         }
 
-   Comment(StringFormat("ORACLE Executor v1.03 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | %s",
+   Comment(StringFormat("ORACLE Executor v1.04 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
