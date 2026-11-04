@@ -1,5 +1,5 @@
 # ORACLE – consignes pour ORACLE_Executor, générées automatiquement depuis le plan (ne pas modifier à la main)
-HEADER;2026.11.04 10:48;1;0.35
+HEADER;2026.11.04 12:48;1;0.35
 ORDER;T06;US500;SELL;STOP;7520;7640;7400;7280;0
 BLACKOUT;2026.11.05 10:45;2026.11.05 11:15
 BLACKOUT;2026.11.05 11:45;2026.11.05 12:15
