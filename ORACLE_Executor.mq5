@@ -3,10 +3,13 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.04 – comptes démo et réel                             |
+//|  Version 1.05 – comptes démo et réel                             |
+//|  1.05 : alertes Telegram directes, journal des trades (GitHub),  |
+//|         filtre de spread, risque total plafonné, réduction après |
+//|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.04"
+#property version   "1.05"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -34,6 +37,16 @@ input string InpSymGold         = "";                   // Symbole de l'or (vide
 input string InpSymBrent        = "";                   // Symbole du Brent (vide = détection auto)
 input string InpSymUS500        = "";                   // Symbole du S&P 500 (vide = détection auto)
 input string InpSymBTC          = "";                   // Symbole du bitcoin (vide = détection auto)
+input string InpTgToken         = "";                   // Telegram : jeton du bot (vide = pas de Telegram)
+input string InpTgChat          = "7351544661";         // Telegram : identifiant de la conversation
+input string InpGitToken        = "";                   // GitHub : jeton « Issues » pour le journal des trades (vide = journal local seulement)
+input string InpGitRepo         = "ayaohsa-max/oracle-signals"; // GitHub : dépôt du journal
+input int    InpGitIssue        = 1;                    // GitHub : numéro du ticket « Journal du robot »
+input double InpMaxSpreadPct    = 10.0;                 // Spread max, en % de la distance entrée-stop (sinon on attend)
+input double InpMaxOpenRiskPct  = 1.5;                  // Risque total max (positions + ordres en attente), en % du capital
+input int    InpLossStreak      = 3;                    // Après N idées perdantes d'affilée...
+input double InpStreakFactor    = 0.5;                  // ...le risque par trade est multiplié par ce facteur
+input double InpTrailATRMult    = 1.0;                  // Sortie « ATR » : stop suiveur à N x ATR(14) journalier sur la 2e moitié
 
 //--- Données
 struct OSignal
@@ -59,15 +72,139 @@ datetime g_bstart[];
 datetime g_bend[];
 int      g_nb       = 0;
 string   g_status   = "";
+int      g_exitMode = 0;     // 0 = break-even après TP1 ; 1 = break-even + stop suiveur ATR
+string   g_tgQueue[];        // messages Telegram en attente d'envoi
+string   g_gitQueue[];       // lignes de journal en attente d'envoi
+string   g_symCache[];       // symboles dont l'ATR est suivi
+int      g_atrHandle[];
 
 //+------------------------------------------------------------------+
 //| Outils                                                           |
 //+------------------------------------------------------------------+
+void QueuePush(string &q[], string item)
+  {
+   int n = ArraySize(q);
+   if(n >= 200) return;                       // sécurité mémoire
+   ArrayResize(q, n + 1);
+   q[n] = item;
+  }
+
+void QueueDropFirst(string &q[])
+  {
+   int n = ArraySize(q);
+   for(int i = 1; i < n; i++) q[i - 1] = q[i];
+   if(n > 0) ArrayResize(q, n - 1);
+  }
+
 void Notify(string msg)
   {
    Print("ORACLE : ", msg);
    if(InpPush)
       SendNotification("ORACLE : " + msg);
+   if(InpTgToken != "")
+      QueuePush(g_tgQueue, "ROBOT ORACLE (" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ") : " + msg);
+  }
+
+string UrlEncode(string s)
+  {
+   uchar b[];
+   int n = StringToCharArray(s, b, 0, WHOLE_ARRAY, CP_UTF8);
+   string r = "";
+   for(int i = 0; i < n - 1; i++)
+     {
+      uchar c = b[i];
+      bool plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+      if(plain) r += CharToString(c);
+      else      r += StringFormat("%%%02X", (int)c);
+     }
+   return r;
+  }
+
+string JsonEscape(string s)
+  {
+   string r = s;
+   StringReplace(r, "\\", "\\\\");
+   StringReplace(r, "\"", "\\\"");
+   StringReplace(r, "\n", "\\n");
+   StringReplace(r, "\r", "");
+   return r;
+  }
+
+int HttpPost(string url, string headers, string body)
+  {
+   char data[], res[];
+   string rh;
+   int n = StringToCharArray(body, data, 0, WHOLE_ARRAY, CP_UTF8);
+   if(n > 0) ArrayResize(data, n - 1);
+   ResetLastError();
+   return WebRequest("POST", url, headers, 8000, data, res, rh);
+  }
+
+bool TgSend(string text)
+  {
+   string url = "https://api.telegram.org/bot" + InpTgToken + "/sendMessage";
+   string body = "chat_id=" + UrlEncode(InpTgChat) + "&text=" + UrlEncode(text);
+   int code = HttpPost(url, "Content-Type: application/x-www-form-urlencoded\r\n", body);
+   if(code != 200)
+      Print("ORACLE : Telegram non envoyé (code ", code, ", erreur ", GetLastError(), "). Ajoutez https://api.telegram.org dans les WebRequest autorisés.");
+   return code == 200 || code == 400 || code == 401 || code == 403;   // 4xx = message ou jeton invalide : inutile de réessayer
+  }
+
+bool GitSend(string line)
+  {
+   string url = "https://api.github.com/repos/" + InpGitRepo + "/issues/" + IntegerToString(InpGitIssue) + "/comments";
+   string hdr = "Authorization: Bearer " + InpGitToken + "\r\nUser-Agent: ORACLE-EA\r\nAccept: application/vnd.github+json\r\nContent-Type: application/json\r\n";
+   int code = HttpPost(url, hdr, "{\"body\":\"" + JsonEscape(line) + "\"}");
+   if(code != 201)
+      Print("ORACLE : journal GitHub non envoyé (code ", code, ", erreur ", GetLastError(), "). Ajoutez https://api.github.com dans les WebRequest autorisés et vérifiez le jeton.");
+   return code == 201 || code == 401 || code == 403 || code == 404 || code == 422;
+  }
+
+void FlushQueues()
+  {
+   int sent = 0;
+   while(ArraySize(g_tgQueue) > 0 && sent < 10)
+     {
+      if(!TgSend(g_tgQueue[0])) break;
+      QueueDropFirst(g_tgQueue);
+      sent++;
+     }
+   sent = 0;
+   while(InpGitToken != "" && ArraySize(g_gitQueue) > 0 && sent < 10)
+     {
+      if(!GitSend(g_gitQueue[0])) break;
+      QueueDropFirst(g_gitQueue);
+      sent++;
+     }
+  }
+
+void JournalLocal(string line)
+  {
+   int h = FileOpen("oracle_journal.csv", FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ);
+   if(h == INVALID_HANDLE) return;
+   FileSeek(h, 0, SEEK_END);
+   FileWriteString(h, line + "\r\n");
+   FileClose(h);
+  }
+
+double AtrD1(string sym)
+  {
+   int k = -1;
+   for(int i = 0; i < ArraySize(g_symCache); i++)
+      if(g_symCache[i] == sym) k = i;
+   if(k < 0)
+     {
+      int h = iATR(sym, PERIOD_D1, 14);
+      if(h == INVALID_HANDLE) return 0;
+      k = ArraySize(g_symCache);
+      ArrayResize(g_symCache, k + 1);
+      ArrayResize(g_atrHandle, k + 1);
+      g_symCache[k] = sym;
+      g_atrHandle[k] = h;
+     }
+   double buf[];
+   if(CopyBuffer(g_atrHandle[k], 0, 1, 1, buf) != 1) return 0;   // ATR de la dernière journée clôturée
+   return buf[0];
   }
 
 string GV(string name) { return "ORACLE_" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + "_" + IntegerToString(InpMagic) + "_" + name; }
@@ -247,6 +384,7 @@ bool Parse(string txt)
          g_updated = StringToTime(f[1]);
          g_enabled = (f[2] == "1");
          g_risk    = StringToDouble(f[3]);
+         g_exitMode = (k >= 5 && f[4] == "1") ? 1 : 0;   // 5e champ facultatif : mode de sortie
          hdr = true;
         }
       else if(f[0] == "ORDER" && k >= 10)
@@ -478,6 +616,69 @@ bool SendPending(string sym, ENUM_ORDER_TYPE ot, double lot, double price, doubl
   }
 
 //+------------------------------------------------------------------+
+//| Risque déjà engagé et série de pertes                            |
+//+------------------------------------------------------------------+
+double LossIfStopped(ENUM_ORDER_TYPE dir, string sym, double vol, double from, double sl)
+  {
+   if(sl <= 0 || vol <= 0) return 0;
+   double pl = 0;
+   if(!OrderCalcProfit(dir, sym, vol, from, sl, pl)) return 0;
+   return (pl < 0) ? -pl : 0;                 // un stop déjà au-delà de l'entrée ne risque plus rien
+  }
+
+double OpenRiskMoney()
+  {
+   double total = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
+      bool buy = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+      total += LossIfStopped(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, PositionGetString(POSITION_SYMBOL),
+                             PositionGetDouble(POSITION_VOLUME), PositionGetDouble(POSITION_PRICE_OPEN), PositionGetDouble(POSITION_SL));
+     }
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong t = OrderGetTicket(i);
+      if(t == 0 || !IsOurs(OrderGetInteger(ORDER_MAGIC))) continue;
+      long ot = OrderGetInteger(ORDER_TYPE);
+      bool buy = (ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP);
+      total += LossIfStopped(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, OrderGetString(ORDER_SYMBOL),
+                             OrderGetDouble(ORDER_VOLUME_CURRENT), OrderGetDouble(ORDER_PRICE_OPEN), OrderGetDouble(ORDER_SL));
+     }
+   return total;
+  }
+
+// Nombre d'idées perdantes consécutives (les deux moitiés d'une idée comptent pour une)
+int LossStreakNow()
+  {
+   if(!HistorySelect(TimeCurrent() - 60 * 86400, TimeCurrent() + 86400)) return 0;
+   int streak = 0, lastId = -1;
+   double ideaPnl = 0;
+   bool any = false;
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+     {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      long m = HistoryDealGetInteger(d, DEAL_MAGIC);
+      if(!IsOurs(m) || HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      int id = MagicId(m);
+      double p = HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_SWAP) + HistoryDealGetDouble(d, DEAL_COMMISSION);
+      if(any && id != lastId)
+        {
+         if(ideaPnl < 0) streak++;
+         else return streak;
+         ideaPnl = 0;
+        }
+      lastId = id;
+      ideaPnl += p;
+      any = true;
+     }
+   if(any && ideaPnl < 0) streak++;
+   return streak;
+  }
+
+//+------------------------------------------------------------------+
 //| Pose d'une idée                                                  |
 //+------------------------------------------------------------------+
 void PlaceSignal(OSignal &s)
@@ -515,10 +716,40 @@ void PlaceSignal(OSignal &s)
       return;
      }
 
+   // filtre de spread : un spread trop large par rapport au stop dégrade le trade, on attend
+   double spread = ask - bid;
+   double stopDist = MathAbs(e - sl);
+   if(stopDist <= 0) return;
+   if(InpMaxSpreadPct > 0 && spread > stopDist * InpMaxSpreadPct / 100.0)
+     {
+      string k = GV("spr_" + IntegerToString(idnum));
+      if(!GlobalVariableCheck(k) || TimeCurrent() - (datetime)GlobalVariableGet(k) > 3600)
+        {
+         Print("ORACLE : ", s.id, " spread trop large (", DoubleToString(spread / stopDist * 100.0, 1), " % du stop), ordre reporté.");
+         GlobalVariableSet(k, (double)TimeCurrent());
+        }
+      return;
+     }
+
    double riskPct = (InpRiskOverride > 0) ? InpRiskOverride : g_risk;
    riskPct = MathMin(riskPct, InpMaxRiskPct);
+   int streak = LossStreakNow();
+   if(InpLossStreak > 0 && streak >= InpLossStreak)
+      riskPct *= InpStreakFactor;               // série de pertes : on réduit jusqu'au prochain gain
    if(riskPct <= 0) return;
-   double riskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * riskPct / 100.0;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * riskPct / 100.0;
+   // plafond du risque total engagé (positions + ordres en attente)
+   if(InpMaxOpenRiskPct > 0 && OpenRiskMoney() + riskMoney > equity * InpMaxOpenRiskPct / 100.0)
+     {
+      string k = GV("heat_" + IntegerToString(idnum));
+      if(!GlobalVariableCheck(k))
+        {
+         Notify(s.id + " : ordre non posé, le risque total engagé dépasserait " + DoubleToString(InpMaxOpenRiskPct, 1) + " % du capital.");
+         GlobalVariableSet(k, 1);
+        }
+      return;
+     }
    ENUM_ORDER_TYPE dir = (s.side == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
    double pl1 = 0;
    if(!OrderCalcProfit(dir, sym, 1.0, e, sl, pl1) || pl1 == 0)
@@ -558,11 +789,12 @@ void PlaceSignal(OSignal &s)
      }
    GlobalVariableSet(GV("tp1_" + IntegerToString(idnum)), t1);
    int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-   Notify(StringFormat("%s %s %s %s posé : entrée %s, stop %s, TP1 %s%s, lots %s+%s, risque %.2f %%",
+   Notify(StringFormat("%s %s %s %s posé : entrée %s, stop %s, TP1 %s%s, lots %s+%s, risque %.2f %%%s",
                        s.id, sym, s.side == "BUY" ? "achat" : "vente", s.type == "LIMIT" ? "limite" : "stop",
                        DoubleToString(e, d), DoubleToString(sl, d), DoubleToString(t1, d),
                        t2 > 0 ? ", TP2 " + DoubleToString(t2, d) : "",
-                       DoubleToString(lotA, 2), DoubleToString(lotB, 2), riskPct));
+                       DoubleToString(lotA, 2), DoubleToString(lotB, 2), riskPct,
+                       (InpLossStreak > 0 && streak >= InpLossStreak) ? " (réduit après " + IntegerToString(streak) + " pertes d'affilée)" : ""));
   }
 
 //+------------------------------------------------------------------+
@@ -626,6 +858,23 @@ void ManageBreakEven()
          g_trade.SetExpertMagicNumber(m);
          if(g_trade.PositionModify(t, open, tp))
             Notify(NumToId(MagicId(m)) + " : TP1 atteint, stop remonté à l'entrée sur la 2e moitié.");
+         continue;
+        }
+      // Sortie « ATR » : une fois à break-even, le stop suit le prix à N x ATR(14) journalier, sans jamais reculer
+      if(g_exitMode == 1 && already && InpTrailATRMult > 0)
+        {
+         double atr = AtrD1(sym);
+         if(atr <= 0) continue;
+         double cand = RoundPrice(sym, buy ? px - InpTrailATRMult * atr : px + InpTrailATRMult * atr);
+         double minGap = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(sym, SYMBOL_POINT);
+         double step = SymbolInfoDouble(sym, SYMBOL_POINT) * 10;
+         bool better = buy ? (cand > sl + step && cand < px - minGap) : (cand < sl - step && cand > px + minGap);
+         if(better)
+           {
+            g_trade.SetExpertMagicNumber(m);
+            if(g_trade.PositionModify(t, cand, tp))
+               Print("ORACLE : ", NumToId(MagicId(m)), " stop suiveur ATR déplacé à ", DoubleToString(cand, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)));
+           }
         }
      }
   }
@@ -745,10 +994,12 @@ void Cycle()
          PlaceSignal(g_sig[i]);
         }
 
-   Comment(StringFormat("ORACLE Executor v1.04 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | %s",
+   Comment(StringFormat("ORACLE Executor v1.05 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
+                        g_exitMode == 1 ? "ATR" : "BE",
+                        InpTgToken != "" ? "oui" : "non", InpGitToken != "" ? "GitHub" : "local",
                         allowed ? "actif" : "en pause : " + why));
   }
 
@@ -781,7 +1032,72 @@ void OnDeinit(const int reason)
    Comment("");
   }
 
-void OnTimer() { Cycle(); }
+void OnTimer()
+  {
+   Cycle();
+   FlushQueues();
+  }
+
+//+------------------------------------------------------------------+
+//| Journal d'un trade clôturé (une ligne par moitié)                |
+//| ORACLE_TRADE;compte;idée;moitié;symbole;sens;ouverture;entrée;   |
+//| stop initial;fermeture;sortie;motif;volume;résultat;devise;R;    |
+//| MFE en R;MAE en R                                                |
+//+------------------------------------------------------------------+
+void JournalTrade(ulong outDeal)
+  {
+   long posId = HistoryDealGetInteger(outDeal, DEAL_POSITION_ID);
+   long m = HistoryDealGetInteger(outDeal, DEAL_MAGIC);
+   string sym = HistoryDealGetString(outDeal, DEAL_SYMBOL);
+   double exitPx = HistoryDealGetDouble(outDeal, DEAL_PRICE);
+   datetime tOut = (datetime)HistoryDealGetInteger(outDeal, DEAL_TIME);
+   double vol = HistoryDealGetDouble(outDeal, DEAL_VOLUME);
+   double pnl = HistoryDealGetDouble(outDeal, DEAL_PROFIT) + HistoryDealGetDouble(outDeal, DEAL_SWAP) + HistoryDealGetDouble(outDeal, DEAL_COMMISSION);
+   long r = HistoryDealGetInteger(outDeal, DEAL_REASON);
+   string why = (r == DEAL_REASON_SL) ? "stop" : (r == DEAL_REASON_TP) ? "objectif" : "cloture";
+
+   double entry = 0, sl0 = 0;
+   datetime tIn = 0;
+   bool buy = true;
+   if(HistorySelectByPosition(posId))
+     {
+      for(int i = 0; i < HistoryDealsTotal(); i++)
+        {
+         ulong d = HistoryDealGetTicket(i);
+         if(d == 0 || HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+         entry = HistoryDealGetDouble(d, DEAL_PRICE);
+         tIn = (datetime)HistoryDealGetInteger(d, DEAL_TIME);
+         buy = HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_BUY;
+         ulong ord = (ulong)HistoryDealGetInteger(d, DEAL_ORDER);
+         if(ord > 0 && HistoryOrderSelect(ord)) sl0 = HistoryOrderGetDouble(ord, ORDER_SL);
+         break;
+        }
+     }
+   double risk = (sl0 > 0 && entry > 0) ? MathAbs(entry - sl0) : 0;
+   double dir = buy ? 1.0 : -1.0;
+   double rMult = (risk > 0) ? dir * (exitPx - entry) / risk : 0;
+   double mfeR = 0, maeR = 0;
+   if(risk > 0 && tIn > 0)
+     {
+      MqlRates rt[];
+      int n = CopyRates(sym, PERIOD_M1, tIn, tOut, rt);
+      if(n > 0)
+        {
+         double hi = rt[0].high, lo = rt[0].low;
+         for(int i = 1; i < n; i++) { hi = MathMax(hi, rt[i].high); lo = MathMin(lo, rt[i].low); }
+         mfeR = buy ? (hi - entry) / risk : (entry - lo) / risk;
+         maeR = buy ? (lo - entry) / risk : (entry - hi) / risk;
+        }
+     }
+   int dg = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   string line = StringFormat("ORACLE_TRADE;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%.2f;%.2f;%s;%.2f;%.2f;%.2f",
+                              AccountInfoInteger(ACCOUNT_LOGIN), NumToId(MagicId(m)), MagicLeg(m) == 1 ? "A" : "B", sym, buy ? "BUY" : "SELL",
+                              TimeToString(tIn, TIME_DATE | TIME_MINUTES), DoubleToString(entry, dg), DoubleToString(sl0, dg),
+                              TimeToString(tOut, TIME_DATE | TIME_MINUTES), DoubleToString(exitPx, dg), why,
+                              vol, pnl, AccountInfoString(ACCOUNT_CURRENCY), rMult, mfeR, maeR);
+   JournalLocal(line);
+   if(InpGitToken != "") QueuePush(g_gitQueue, line);
+  }
 
 //+------------------------------------------------------------------+
 //| Notifications d'exécution                                        |
@@ -809,6 +1125,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
       long r = HistoryDealGetInteger(trans.deal, DEAL_REASON);
       string why = (r == DEAL_REASON_SL) ? "stop" : (r == DEAL_REASON_TP) ? "objectif" : "clôture";
       Notify(StringFormat("%s %s fermé (%s) à %s, résultat %.2f %s", id, sym, why, DoubleToString(price, d), pnl, AccountInfoString(ACCOUNT_CURRENCY)));
+      JournalTrade(trans.deal);
      }
   }
 //+------------------------------------------------------------------+
