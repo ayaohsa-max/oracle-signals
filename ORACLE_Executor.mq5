@@ -3,13 +3,17 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.05 – comptes démo et réel                             |
+//|  Version 1.06 – comptes démo et réel                             |
+//|  1.06 : moteur SAV-AFS intégré (structure LL/HH, Fibonacci,      |
+//|         BOS, filtre de tendance) en H1 et H4, dans le sens du    |
+//|         biais fondamental publié par ORACLE ; mode observation   |
+//|         (statistiques) ou trading.                               |
 //|  1.05 : alertes Telegram directes, journal des trades (GitHub),  |
 //|         filtre de spread, risque total plafonné, réduction après |
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.05"
+#property version   "1.06"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -47,6 +51,12 @@ input double InpMaxOpenRiskPct  = 1.5;                  // Risque total max (pos
 input int    InpLossStreak      = 3;                    // Après N idées perdantes d'affilée...
 input double InpStreakFactor    = 0.5;                  // ...le risque par trade est multiplié par ce facteur
 input double InpTrailATRMult    = 1.0;                  // Sortie « ATR » : stop suiveur à N x ATR(14) journalier sur la 2e moitié
+input int    InpSavMode         = -1;                   // SAV-AFS : -1 = selon ORACLE, 0 = arrêt, 1 = observation, 2 = trading
+input double InpSavRR           = 2.0;                  // SAV-AFS : ratio gain / risque
+input double InpSavAtrMult      = 0.2;                  // SAV-AFS : marge du stop (x ATR 14 de l'unité)
+input double InpSavFibMin       = 0.5;                  // SAV-AFS : début de la zone de retracement
+input double InpSavFibMax       = 0.786;                // SAV-AFS : fin de la zone de retracement
+input int    InpSavMaxBars      = 60;                   // SAV-AFS : durée max d'une étape (bougies)
 
 //--- Données
 struct OSignal
@@ -77,6 +87,18 @@ string   g_tgQueue[];        // messages Telegram en attente d'envoi
 string   g_gitQueue[];       // lignes de journal en attente d'envoi
 string   g_symCache[];       // symboles dont l'ATR est suivi
 int      g_atrHandle[];
+int      g_savMode  = 1;     // SAV-AFS : 0 = arrêt, 1 = observation, 2 = trading (valeur ORACLE)
+string   g_biasAsset[];      // biais fondamental publié par ORACLE, par actif
+int      g_biasVal[];        // 1 = haussier, -1 = baissier, 0 = neutre
+// signaux SAV-AFS suivis en observation (trades virtuels)
+string   g_vAsset[];
+string   g_vSym[];
+int      g_vTf[];            // 1 = H1, 4 = H4
+int      g_vBuy[];
+datetime g_vTime[];
+double   g_vE[];
+double   g_vSL[];
+double   g_vTP[];
 
 //+------------------------------------------------------------------+
 //| Outils                                                           |
@@ -214,7 +236,7 @@ int IdToNum(string id)
   {
    if(StringLen(id) < 2) return -1;
    ushort c = StringGetCharacter(id, 0);
-   int code = (c == 'T') ? 1 : (c == 'S') ? 2 : 3;
+   int code = (c == 'T') ? 1 : (c == 'S') ? 2 : 3;   // 3 = V (signaux SAV-AFS du robot)
    int n = (int)StringToInteger(StringSubstr(id, 1));
    if(n < 0 || n > 99) return -1;
    return code * 100 + n;
@@ -223,7 +245,7 @@ int IdToNum(string id)
 string NumToId(int num)
   {
    int code = num / 100, n = num % 100;
-   string p = (code == 1) ? "T" : (code == 2) ? "S" : "X";
+   string p = (code == 1) ? "T" : (code == 2) ? "S" : "V";
    return p + StringFormat("%02d", n);
   }
 
@@ -369,6 +391,8 @@ bool Parse(string txt)
    ArrayResize(g_bstart, 0);
    ArrayResize(g_bend, 0);
    g_nb = 0;
+   ArrayResize(g_biasAsset, 0);
+   ArrayResize(g_biasVal, 0);
    bool hdr = false;
    for(int i = 0; i < n; i++)
      {
@@ -385,6 +409,7 @@ bool Parse(string txt)
          g_enabled = (f[2] == "1");
          g_risk    = StringToDouble(f[3]);
          g_exitMode = (k >= 5 && f[4] == "1") ? 1 : 0;   // 5e champ facultatif : mode de sortie
+         g_savMode  = (k >= 6) ? (int)StringToInteger(f[5]) : 1;   // 6e champ facultatif : mode SAV-AFS
          hdr = true;
         }
       else if(f[0] == "ORDER" && k >= 10)
@@ -410,6 +435,15 @@ bool Parse(string txt)
            }
          ArrayResize(g_sig, g_nsig + 1);
          g_sig[g_nsig++] = s;
+        }
+      else if(f[0] == "BIAS" && k >= 3)
+        {
+         int v = (int)StringToInteger(f[2]);
+         int nb = ArraySize(g_biasAsset);
+         ArrayResize(g_biasAsset, nb + 1);
+         ArrayResize(g_biasVal, nb + 1);
+         g_biasAsset[nb] = f[1];
+         g_biasVal[nb]   = (v > 0) ? 1 : (v < 0) ? -1 : 0;
         }
       else if(f[0] == "BLACKOUT" && k >= 3)
         {
@@ -880,6 +914,375 @@ void ManageBreakEven()
   }
 
 //+------------------------------------------------------------------+
+//| SAV-AFS : moteur intégré (traduction du script TradingView v5)   |
+//| Achat : biais haussier -> LL -> impulsion -> retracement Fibo -> |
+//|         HL -> BOS (clôture au-dessus du sommet de l'impulsion)   |
+//| Vente : miroir exact.                                            |
+//| H4 : pivots 3 + prix / SMA 200 ; H1 : pivots 5 + EMA20>EMA50>SMA200|
+//| Entrée au BOS confirmé (clôture), stop sous le HL - 0,2 ATR,     |
+//| objectif 2R. Calcul refait à chaque nouvelle bougie clôturée sur |
+//| tout l'historique récent : aucun état perdu au redémarrage.      |
+//+------------------------------------------------------------------+
+struct SavHit
+  {
+   bool              found;
+   bool              buy;
+   double            entry;
+   double            sl;
+   double            tp;
+   datetime          t;      // heure d'ouverture de la bougie du signal
+  };
+
+int SavModeNow() { return (InpSavMode >= 0) ? InpSavMode : g_savMode; }
+
+int BiasOf(string asset)
+  {
+   for(int i = 0; i < ArraySize(g_biasAsset); i++)
+      if(g_biasAsset[i] == asset) return g_biasVal[i];
+   return 0;
+  }
+
+bool IsPivotHigh(MqlRates &r[], int c, int L)
+  {
+   for(int j = c - L; j <= c + L; j++)
+     {
+      if(j == c) continue;
+      if(j < c && r[j].high >= r[c].high) return false;
+      if(j > c && r[j].high >  r[c].high) return false;
+     }
+   return true;
+  }
+
+bool IsPivotLow(MqlRates &r[], int c, int L)
+  {
+   for(int j = c - L; j <= c + L; j++)
+     {
+      if(j == c) continue;
+      if(j < c && r[j].low <= r[c].low) return false;
+      if(j > c && r[j].low <  r[c].low) return false;
+     }
+   return true;
+  }
+
+// Rejoue la structure sur ~700 bougies et dit si la dernière bougie clôturée donne un signal.
+bool SavScan(string sym, ENUM_TIMEFRAMES tf, int L, bool aligned, SavHit &hit)
+  {
+   hit.found = false;
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   int n = CopyRates(sym, tf, 0, 700, r);
+   if(n < 260) return false;
+   int last = n - 2;                              // dernière bougie clôturée (n - 1 = bougie en cours)
+
+   double atr[], e20[], e50[], s200[];
+   ArrayResize(atr, n); ArrayResize(e20, n); ArrayResize(e50, n); ArrayResize(s200, n);
+   double sumTR = 0, sum200 = 0;
+   double a20 = 2.0 / 21.0, a50 = 2.0 / 51.0;
+   for(int i = 0; i < n; i++)
+     {
+      double tr = (i == 0) ? r[i].high - r[i].low :
+                  MathMax(r[i].high - r[i].low, MathMax(MathAbs(r[i].high - r[i - 1].close), MathAbs(r[i].low - r[i - 1].close)));
+      if(i < 14) { sumTR += tr; atr[i] = sumTR / (i + 1); }
+      else atr[i] = (atr[i - 1] * 13.0 + tr) / 14.0;        // ATR de Wilder, comme ta.atr
+      e20[i] = (i == 0) ? r[i].close : a20 * r[i].close + (1 - a20) * e20[i - 1];
+      e50[i] = (i == 0) ? r[i].close : a50 * r[i].close + (1 - a50) * e50[i - 1];
+      sum200 += r[i].close;
+      if(i >= 200) sum200 -= r[i - 200].close;
+      s200[i] = (i >= 199) ? sum200 / 200.0 : 0;
+     }
+
+   double fMin = InpSavFibMin, fMax = InpSavFibMax;
+   int mb = InpSavMaxBars;
+   double prevPH = 0, prevPL = 0;
+   bool havePH = false, havePL = false;
+   // achat
+   int bState = 0, bLLBar = -1, bHBar = -1, bHLBar = -1;
+   double bLL = 0, bH = 0, bHL = 0;
+   // vente
+   int sState = 0, sHHBar = -1, sLBar = -1, sLHBar = -1;
+   double sHH = 0, sL = 0, sLH = 0;
+
+   for(int t = 2 * L; t <= last; t++)
+     {
+      int pb = t - L;
+      bool newPH = IsPivotHigh(r, pb, L);
+      bool newPL = IsPivotLow(r, pb, L);
+      double ph = r[pb].high, pl = r[pb].low;
+      bool isHH = newPH && havePH && ph > prevPH;
+      bool isLL = newPL && havePL && pl < prevPL;
+      bool trendOk = (t >= 199);
+      bool trendLong  = trendOk && (aligned ? (e20[t] > e50[t] && e50[t] > s200[t]) : r[t].close > s200[t]);
+      bool trendShort = trendOk && (aligned ? (e20[t] < e50[t] && e50[t] < s200[t]) : r[t].close < s200[t]);
+
+      //--- ACHAT : a) annulations
+      if(bState > 0 && r[t].low < bLL) bState = 0;
+      if(bState == 1 && t - bLLBar > mb) bState = 0;
+      if(bState == 2 && (r[t].low < bH - (bH - bLL) * fMax || t - bHBar > mb)) bState = 0;
+      if(bState == 3 && (r[t].close < bHL || t - bHLBar > mb)) bState = 0;
+      // b) nouveau LL
+      if(isLL && bState <= 1) { bState = 1; bLL = pl; bLLBar = pb; }
+      // c) impulsion
+      if(newPH && bLLBar >= 0 && pb > bLLBar && (bState == 1 || (bState == 2 && ph > bH))) { bH = ph; bHBar = pb; bState = 2; }
+      // d) HL dans la zone Fibonacci
+      if(bState == 2 && newPL && pb > bHBar)
+        {
+         double rg = bH - bLL;
+         if(rg > 0)
+           {
+            double retr = (bH - pl) / rg;
+            if(retr >= fMin && retr <= fMax) { bHL = pl; bHLBar = pb; bState = 3; }
+            else if(retr > fMax) bState = 0;
+           }
+        }
+      // e) BOS
+      if(bState == 3 && r[t].close > bH)
+        {
+         if(trendLong && t == last)
+           {
+            hit.found = true; hit.buy = true; hit.entry = r[t].close;
+            hit.sl = bHL - atr[t] * InpSavAtrMult;
+            hit.tp = hit.entry + (hit.entry - hit.sl) * InpSavRR;
+            hit.t = r[t].time;
+           }
+         bState = 0;
+        }
+
+      //--- VENTE : miroir
+      if(sState > 0 && r[t].high > sHH) sState = 0;
+      if(sState == 1 && t - sHHBar > mb) sState = 0;
+      if(sState == 2 && (r[t].high > sL + (sHH - sL) * fMax || t - sLBar > mb)) sState = 0;
+      if(sState == 3 && (r[t].close > sLH || t - sLHBar > mb)) sState = 0;
+      if(isHH && sState <= 1) { sState = 1; sHH = ph; sHHBar = pb; }
+      if(newPL && sHHBar >= 0 && pb > sHHBar && (sState == 1 || (sState == 2 && pl < sL))) { sL = pl; sLBar = pb; sState = 2; }
+      if(sState == 2 && newPH && pb > sLBar)
+        {
+         double rg = sHH - sL;
+         if(rg > 0)
+           {
+            double retr = (ph - sL) / rg;
+            if(retr >= fMin && retr <= fMax) { sLH = ph; sLHBar = pb; sState = 3; }
+            else if(retr > fMax) sState = 0;
+           }
+        }
+      if(sState == 3 && r[t].close < sL)
+        {
+         if(trendShort && t == last && !hit.found)
+           {
+            hit.found = true; hit.buy = false; hit.entry = r[t].close;
+            hit.sl = sLH + atr[t] * InpSavAtrMult;
+            hit.tp = hit.entry - (hit.sl - hit.entry) * InpSavRR;
+            hit.t = r[t].time;
+           }
+         sState = 0;
+        }
+
+      if(newPH) { prevPH = ph; havePH = true; }
+      if(newPL) { prevPL = pl; havePL = true; }
+     }
+   return true;
+  }
+
+//--- trades virtuels (mode observation), sauvegardés dans MQL5\Files
+void SaveVirtual()
+  {
+   int h = FileOpen("oracle_sav_virtual.csv", FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE) return;
+   for(int i = 0; i < ArraySize(g_vSym); i++)
+      FileWriteString(h, StringFormat("%s;%s;%d;%d;%I64d;%.10g;%.10g;%.10g\r\n", g_vAsset[i], g_vSym[i], g_vTf[i], g_vBuy[i],
+                                      (long)g_vTime[i], g_vE[i], g_vSL[i], g_vTP[i]));
+   FileClose(h);
+  }
+
+void AddVirtual(string asset, string sym, int tfh, bool buy, datetime t, double e, double sl, double tp)
+  {
+   int n = ArraySize(g_vSym);
+   if(n >= 100) return;
+   ArrayResize(g_vAsset, n + 1); ArrayResize(g_vSym, n + 1); ArrayResize(g_vTf, n + 1); ArrayResize(g_vBuy, n + 1);
+   ArrayResize(g_vTime, n + 1); ArrayResize(g_vE, n + 1); ArrayResize(g_vSL, n + 1); ArrayResize(g_vTP, n + 1);
+   g_vAsset[n] = asset; g_vSym[n] = sym; g_vTf[n] = tfh; g_vBuy[n] = buy ? 1 : 0;
+   g_vTime[n] = t; g_vE[n] = e; g_vSL[n] = sl; g_vTP[n] = tp;
+  }
+
+void RemoveVirtual(int k)
+  {
+   int n = ArraySize(g_vSym);
+   for(int i = k; i < n - 1; i++)
+     {
+      g_vAsset[i] = g_vAsset[i + 1]; g_vSym[i] = g_vSym[i + 1]; g_vTf[i] = g_vTf[i + 1]; g_vBuy[i] = g_vBuy[i + 1];
+      g_vTime[i] = g_vTime[i + 1]; g_vE[i] = g_vE[i + 1]; g_vSL[i] = g_vSL[i + 1]; g_vTP[i] = g_vTP[i + 1];
+     }
+   ArrayResize(g_vAsset, n - 1); ArrayResize(g_vSym, n - 1); ArrayResize(g_vTf, n - 1); ArrayResize(g_vBuy, n - 1);
+   ArrayResize(g_vTime, n - 1); ArrayResize(g_vE, n - 1); ArrayResize(g_vSL, n - 1); ArrayResize(g_vTP, n - 1);
+  }
+
+void LoadVirtual()
+  {
+   string txt;
+   if(!LoadFile("oracle_sav_virtual.csv", txt)) return;
+   StringReplace(txt, "\r", "");
+   string lines[];
+   int n = StringSplit(txt, '\n', lines);
+   for(int i = 0; i < n; i++)
+     {
+      string f[];
+      if(StringSplit(lines[i], ';', f) < 8) continue;
+      AddVirtual(f[0], f[1], (int)StringToInteger(f[2]), f[3] == "1", (datetime)StringToInteger(f[4]),
+                 StringToDouble(f[5]), StringToDouble(f[6]), StringToDouble(f[7]));
+     }
+  }
+
+void SavJournal(string line)
+  {
+   JournalLocal(line);
+   if(InpGitToken != "") QueuePush(g_gitQueue, line);
+  }
+
+// Suivi des trades virtuels : stop ou objectif touché sur les bougies suivantes (stop prioritaire si les deux)
+void UpdateVirtual()
+  {
+   bool changed = false;
+   for(int i = ArraySize(g_vSym) - 1; i >= 0; i--)
+     {
+      ENUM_TIMEFRAMES tf = (g_vTf[i] == 4) ? PERIOD_H4 : PERIOD_H1;
+      MqlRates r[];
+      ArraySetAsSeries(r, false);
+      int n = CopyRates(g_vSym[i], tf, g_vTime[i] + PeriodSeconds(tf), TimeCurrent(), r);
+      if(n <= 0) continue;
+      bool buy = (g_vBuy[i] == 1);
+      double risk = MathAbs(g_vE[i] - g_vSL[i]);
+      double R = 0;
+      bool done = false;
+      string why = "";
+      for(int j = 0; j < n && !done; j++)
+        {
+         bool hitSL = buy ? (r[j].low <= g_vSL[i]) : (r[j].high >= g_vSL[i]);
+         bool hitTP = buy ? (r[j].high >= g_vTP[i]) : (r[j].low <= g_vTP[i]);
+         if(hitSL) { R = -1.0; done = true; why = "stop"; }
+         else if(hitTP) { R = InpSavRR; done = true; why = "objectif"; }
+        }
+      if(!done && TimeCurrent() - g_vTime[i] > 20 * 86400 && risk > 0)
+        {
+         double last = r[n - 1].close;
+         R = (buy ? last - g_vE[i] : g_vE[i] - last) / risk;
+         done = true; why = "expire";
+        }
+      if(done)
+        {
+         SavJournal(StringFormat("SAV_RESULT;%I64d;%s;%s;H%d;%s;%s;%s;%.2f;OBS",
+                                 AccountInfoInteger(ACCOUNT_LOGIN), g_vAsset[i], g_vSym[i], g_vTf[i], buy ? "BUY" : "SELL",
+                                 TimeToString(g_vTime[i], TIME_DATE | TIME_MINUTES), why, R));
+         RemoveVirtual(i);
+         changed = true;
+        }
+     }
+   if(changed) SaveVirtual();
+  }
+
+// Ordre au marché pour un signal SAV-AFS (mode trading), mêmes garde-fous de risque que les idées du plan
+bool PlaceSavMarket(string asset, string sym, int tfh, SavHit &h)
+  {
+   if(SymbolInfoInteger(sym, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL) return false;
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID), ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   if(bid <= 0 || ask <= 0) return false;
+   double px = h.buy ? ask : bid;
+   double sl = RoundPrice(sym, h.sl);
+   double gap = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(h.buy ? (sl >= bid - gap) : (sl <= ask + gap)) { Print("ORACLE : SAV ", sym, " le prix est déjà au stop, signal ignoré."); return false; }
+   double dist = MathAbs(px - sl);
+   double tp = RoundPrice(sym, h.buy ? px + dist * InpSavRR : px - dist * InpSavRR);
+   if(InpMaxSpreadPct > 0 && (ask - bid) > dist * InpMaxSpreadPct / 100.0) { Print("ORACLE : SAV ", sym, " spread trop large, signal ignoré."); return false; }
+
+   double riskPct = MathMin((InpRiskOverride > 0) ? InpRiskOverride : g_risk, InpMaxRiskPct);
+   int streak = LossStreakNow();
+   if(InpLossStreak > 0 && streak >= InpLossStreak) riskPct *= InpStreakFactor;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * riskPct / 100.0;
+   if(InpMaxOpenRiskPct > 0 && OpenRiskMoney() + riskMoney > equity * InpMaxOpenRiskPct / 100.0)
+     {
+      Print("ORACLE : SAV ", sym, " non pris, risque total engagé au plafond.");
+      return false;
+     }
+   double pl1 = 0;
+   if(!OrderCalcProfit(h.buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, sym, 1.0, px, sl, pl1) || pl1 == 0) return false;
+   double lot = NormLot(sym, riskMoney / MathAbs(pl1));
+   if(lot <= 0) { Print("ORACLE : SAV ", sym, " capital trop petit pour ce stop."); return false; }
+
+   int seq = GlobalVariableCheck(GV("sav_seq")) ? (int)GlobalVariableGet(GV("sav_seq")) : 0;
+   int idnum = -1;
+   for(int k = 0; k < 99; k++)
+     {
+      seq = seq % 99 + 1;
+      if(!HasOrderOrPosition(300 + seq)) { idnum = 300 + seq; break; }
+     }
+   if(idnum < 0) return false;
+   GlobalVariableSet(GV("sav_seq"), seq);
+   string id = NumToId(idnum);
+   g_trade.SetExpertMagicNumber(MakeMagic(idnum, 1));
+   g_trade.SetTypeFillingBySymbol(sym);
+   string cmt = "ORACLE " + id + " SAV H" + IntegerToString(tfh);
+   bool ok = h.buy ? g_trade.Buy(lot, sym, 0, sl, tp, cmt) : g_trade.Sell(lot, sym, 0, sl, tp, cmt);
+   if(!ok || (g_trade.ResultRetcode() != TRADE_RETCODE_DONE && g_trade.ResultRetcode() != TRADE_RETCODE_PLACED))
+     {
+      Print("ORACLE : SAV ", sym, " refus du courtier : ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
+      return false;
+     }
+   int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   Notify(StringFormat("%s SAV-AFS H%d %s %s au marché : stop %s, objectif %s (%.1fR), lot %s, risque %.2f %%",
+                       id, tfh, sym, h.buy ? "achat" : "vente", DoubleToString(sl, d), DoubleToString(tp, d), InpSavRR,
+                       DoubleToString(lot, 2), riskPct));
+   return true;
+  }
+
+// Appelé à chaque cycle : une analyse par actif et par unité, à chaque nouvelle bougie clôturée
+void SavProcess(bool allowed)
+  {
+   int mode = SavModeNow();
+   if(mode <= 0) return;
+   UpdateVirtual();
+   for(int i = 0; i < ArraySize(g_biasAsset); i++)
+     {
+      int bias = g_biasVal[i];
+      if(bias == 0) continue;                     // biais neutre : aucun signal (comme le script TradingView)
+      string asset = g_biasAsset[i];
+      string sym = ResolveSymbol(asset);
+      if(sym == "") continue;
+      for(int u = 0; u < 2; u++)
+        {
+         ENUM_TIMEFRAMES tf = (u == 0) ? PERIOD_H4 : PERIOD_H1;
+         int tfh = (u == 0) ? 4 : 1;
+         int L = (u == 0) ? 3 : 5;
+         bool aligned = (u == 1);
+         datetime barT = iTime(sym, tf, 1);
+         if(barT == 0) continue;
+         string key = GV("sv" + IntegerToString(tfh) + "_" + sym);
+         if(GlobalVariableCheck(key) && (datetime)GlobalVariableGet(key) == barT) continue;
+         SavHit h;
+         if(!SavScan(sym, tf, L, aligned, h)) continue;   // historique pas encore chargé : on réessaiera
+         GlobalVariableSet(key, (double)barT);
+         if(!h.found) continue;
+         if(h.buy != (bias > 0)) continue;          // seulement dans le sens du biais fondamental
+         if(TimeCurrent() - (h.t + PeriodSeconds(tf)) > 15 * 60) continue;   // signal trop ancien (robot redémarré)
+         int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+         string taken = "OBS";
+         if(mode == 2)
+           {
+            taken = "NON_PRIS";
+            if(allowed && CountActiveIds() < InpMaxTrades && PlaceSavMarket(asset, sym, tfh, h)) taken = "PRIS";
+           }
+         else
+           {
+            AddVirtual(asset, sym, tfh, h.buy, h.t, h.entry, h.sl, h.tp);
+            SaveVirtual();
+           }
+         SavJournal(StringFormat("SAV_SIGNAL;%I64d;%s;%s;H%d;%s;%s;%s;%s;%s;%s",
+                                 AccountInfoInteger(ACCOUNT_LOGIN), asset, sym, tfh, h.buy ? "BUY" : "SELL",
+                                 TimeToString(h.t + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                 DoubleToString(h.entry, d), DoubleToString(h.sl, d), DoubleToString(h.tp, d), taken));
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Boucle principale                                                |
 //+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
@@ -994,11 +1397,17 @@ void Cycle()
          PlaceSignal(g_sig[i]);
         }
 
-   Comment(StringFormat("ORACLE Executor v1.05 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | Telegram %s | journal %s | %s",
+   SavProcess(allowed);
+   int sm = SavModeNow();
+   int nbias = 0;
+   for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
+
+   Comment(StringFormat("ORACLE Executor v1.06 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
                         g_exitMode == 1 ? "ATR" : "BE",
+                        sm == 2 ? "trading" : sm == 1 ? "observation" : "arrêt", nbias, ArraySize(g_vSym),
                         InpTgToken != "" ? "oui" : "non", InpGitToken != "" ? "GitHub" : "local",
                         allowed ? "actif" : "en pause : " + why));
   }
@@ -1016,6 +1425,7 @@ int OnInit()
      }
    g_trade.SetDeviationInPoints(30);
    EventSetTimer(MathMax(10, InpPollSeconds));
+   LoadVirtual();
    Notify("robot démarré (compte " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ")");
    Cycle();
    return INIT_SUCCEEDED;
