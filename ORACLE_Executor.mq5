@@ -3,7 +3,9 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.06 – comptes démo et réel                             |
+//|  Version 1.07 – comptes démo et réel                             |
+//|  1.07 : perte max totale « suiveuse » comme FTMO (depuis le plus |
+//|         haut de l'équité), bilan quotidien dans le journal.       |
 //|  1.06 : moteur SAV-AFS intégré (structure LL/HH, Fibonacci,      |
 //|         BOS, filtre de tendance) en H1 et H4, dans le sens du    |
 //|         biais fondamental publié par ORACLE ; mode observation   |
@@ -13,7 +15,7 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.06"
+#property version   "1.07"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -27,6 +29,7 @@ input double InpRiskOverride    = 0.0;                  // Risque % par trade (0
 input double InpMaxRiskPct      = 1.0;                  // Plafond absolu du risque % par trade
 input double InpMaxDailyLossPct = 4.0;                  // Perte max du jour en % (coupe tout jusqu'au lendemain)
 input double InpMaxTotalLossPct = 8.0;                  // Perte max totale en % (arrêt définitif)
+input bool   InpTrailingMaxLoss = true;                 // Perte max totale mesurée depuis le plus haut de l'équité (règle FTMO « trailing »)
 input int    InpMaxTrades       = 3;                    // Nombre max d'idées ouvertes ou en attente
 input double InpMaxSignalAgeH   = 36;                   // Consignes plus vieilles = on annule les ordres en attente
 input bool   InpAutoAdjust      = true;                 // Recaler les niveaux spot sur le prix du courtier
@@ -568,13 +571,29 @@ bool GuardsBlock()
    double day = dt.year * 10000 + dt.mon * 100 + dt.day;
    if(!GlobalVariableCheck(GV("day")) || GlobalVariableGet(GV("day")) != day)
      {
+      if(GlobalVariableCheck(GV("day")) && GlobalVariableCheck(GV("day_bal")))
+        {
+         // bilan de la journée écoulée (journal local + GitHub), pas de Telegram
+         double prevBal = GlobalVariableGet(GV("day_bal"));
+         double pk = GlobalVariableCheck(GV("peak_eq")) ? GlobalVariableGet(GV("peak_eq")) : eq;
+         string ln = StringFormat("ORACLE_DAY;%I64d;%.0f;%.2f;%.2f;%.2f;%.2f;%s",
+                                  AccountInfoInteger(ACCOUNT_LOGIN), GlobalVariableGet(GV("day")), bal, eq, pk,
+                                  bal - prevBal, AccountInfoString(ACCOUNT_CURRENCY));
+         JournalLocal(ln);
+         if(InpGitToken != "") QueuePush(g_gitQueue, ln);
+        }
       GlobalVariableSet(GV("day"), day);
       GlobalVariableSet(GV("day_bal"), bal);
       if(GlobalVariableCheck(GV("halt_day"))) GlobalVariableDel(GV("halt_day"));
      }
    double dayBal   = GlobalVariableGet(GV("day_bal"));
    double startBal = GlobalVariableGet(GV("start_bal"));
-   if(eq <= startBal * (1.0 - InpMaxTotalLossPct / 100.0))
+   // plus haut de l'équité (pour la perte max « suiveuse »)
+   double peak = GlobalVariableCheck(GV("peak_eq")) ? GlobalVariableGet(GV("peak_eq")) : MathMax(startBal, eq);
+   if(eq > peak) peak = eq;
+   GlobalVariableSet(GV("peak_eq"), peak);
+   double refTotal = InpTrailingMaxLoss ? peak : startBal;
+   if(eq <= refTotal * (1.0 - InpMaxTotalLossPct / 100.0))
      {
       GlobalVariableSet(GV("halt_total"), 1);
       CloseAll(StringFormat("perte totale de %.1f %% atteinte", InpMaxTotalLossPct));
@@ -1402,7 +1421,7 @@ void Cycle()
    int nbias = 0;
    for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
 
-   Comment(StringFormat("ORACLE Executor v1.06 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | Telegram %s | journal %s | %s",
+   Comment(StringFormat("ORACLE Executor v1.07 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
