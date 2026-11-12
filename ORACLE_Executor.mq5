@@ -3,7 +3,10 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.07 – comptes démo et réel                             |
+//|  Version 1.08 – comptes démo et réel                             |
+//|  1.08 : signal de vie horaire dans le ticket GitHub n°2, alerte  |
+//|         Telegram quand les consignes sont trop anciennes ou      |
+//|         illisibles (et à la reprise).                           |
 //|  1.07 : perte max totale « suiveuse » comme FTMO (depuis le plus |
 //|         haut de l'équité), bilan quotidien dans le journal.       |
 //|  1.06 : moteur SAV-AFS intégré (structure LL/HH, Fibonacci,      |
@@ -15,7 +18,7 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.07"
+#property version   "1.08"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -32,6 +35,7 @@ input double InpMaxTotalLossPct = 8.0;                  // Perte max totale en %
 input bool   InpTrailingMaxLoss = true;                 // Perte max totale mesurée depuis le plus haut de l'équité (règle FTMO « trailing »)
 input int    InpMaxTrades       = 3;                    // Nombre max d'idées ouvertes ou en attente
 input double InpMaxSignalAgeH   = 36;                   // Consignes plus vieilles = on annule les ordres en attente
+input bool   InpAlertStale      = true;                 // Alerte Telegram si consignes trop anciennes / illisibles (en semaine)
 input bool   InpAutoAdjust      = true;                 // Recaler les niveaux spot sur le prix du courtier
 input double InpMaxAdjustPct    = 1.0;                  // Écart spot/courtier max accepté (%)
 input bool   InpBreakEven       = true;                 // Stop à l'entrée sur la 2e moitié une fois TP1 touché
@@ -49,6 +53,8 @@ input string InpTgChat          = "7351544661";         // Telegram : identifian
 input string InpGitToken        = "";                   // GitHub : jeton « Issues » pour le journal des trades (vide = journal local seulement)
 input string InpGitRepo         = "ayaohsa-max/oracle-signals"; // GitHub : dépôt du journal
 input int    InpGitIssue        = 1;                    // GitHub : numéro du ticket « Journal du robot »
+input int    InpBeatIssue       = 2;                    // GitHub : numéro du ticket « Signal de vie » (0 = désactivé)
+input int    InpBeatMinutes     = 60;                   // Signal de vie toutes les N minutes
 input double InpMaxSpreadPct    = 10.0;                 // Spread max, en % de la distance entrée-stop (sinon on attend)
 input double InpMaxOpenRiskPct  = 1.5;                  // Risque total max (positions + ordres en attente), en % du capital
 input int    InpLossStreak      = 3;                    // Après N idées perdantes d'affilée...
@@ -88,6 +94,10 @@ string   g_status   = "";
 int      g_exitMode = 0;     // 0 = break-even après TP1 ; 1 = break-even + stop suiveur ATR
 string   g_tgQueue[];        // messages Telegram en attente d'envoi
 string   g_gitQueue[];       // lignes de journal en attente d'envoi
+string   g_state     = "démarrage"; // état affiché, repris dans le signal de vie
+datetime g_lastBeat  = 0;    // dernier signal de vie envoyé (heure locale)
+datetime g_lastOk    = 0;    // dernière lecture réussie des consignes (GMT)
+bool     g_staleSent = false; // alerte « consignes » déjà envoyée
 string   g_symCache[];       // symboles dont l'ATR est suivi
 int      g_atrHandle[];
 int      g_savMode  = 1;     // SAV-AFS : 0 = arrêt, 1 = observation, 2 = trading (valeur ORACLE)
@@ -175,9 +185,10 @@ bool TgSend(string text)
    return code == 200 || code == 400 || code == 401 || code == 403;   // 4xx = message ou jeton invalide : inutile de réessayer
   }
 
-bool GitSend(string line)
+bool GitSend(string line, int issue = 0)
   {
-   string url = "https://api.github.com/repos/" + InpGitRepo + "/issues/" + IntegerToString(InpGitIssue) + "/comments";
+   if(issue <= 0) issue = InpGitIssue;
+   string url = "https://api.github.com/repos/" + InpGitRepo + "/issues/" + IntegerToString(issue) + "/comments";
    string hdr = "Authorization: Bearer " + InpGitToken + "\r\nUser-Agent: ORACLE-EA\r\nAccept: application/vnd.github+json\r\nContent-Type: application/json\r\n";
    int code = HttpPost(url, hdr, "{\"body\":\"" + JsonEscape(line) + "\"}");
    if(code != 201)
@@ -1367,6 +1378,46 @@ string LockName() { return "ORACLE_LOCK_" + IntegerToString(InpMagic); }
 string BeatName() { return "ORACLE_BEAT_" + IntegerToString(InpMagic); }
 double ChartKey() { return (double)(ChartID() % 1000000007); }  // tient sans perte dans un double
 
+// Alerte (une seule fois) quand les consignes sont trop anciennes ou illisibles, puis à la reprise.
+// En semaine seulement, après 8h GMT : évite l'alerte du lundi matin avant la première publication.
+void StaleAlert(bool ok, bool stale, int wk)
+  {
+   if(!InpAlertStale) return;
+   MqlDateTime g;
+   TimeToStruct(TimeGMT(), g);
+   bool office = (wk == 0 && g.day_of_week >= 1 && g.day_of_week <= 5 && g.hour >= 8);
+   bool bad = ok ? stale : (g_lastOk == 0 || TimeGMT() - g_lastOk > 3600);   // illisible depuis plus d'1 h
+   if(bad && office && !g_staleSent)
+     {
+      g_staleSent = true;
+      Notify(ok ? "ALERTE : consignes trop anciennes (publiées le " + TimeToString(g_updated, TIME_DATE | TIME_MINUTES) +
+                  " UTC). Robot en pause, ordres en attente annulés. Vérifier les tâches ORACLE."
+                : "ALERTE : consignes illisibles depuis plus d'1 h (réseau, GitHub ou WebRequest). Robot en pause.");
+     }
+   else if(!bad && !stale && g_staleSent)
+     {
+      g_staleSent = false;
+      Notify("consignes de nouveau à jour (" + TimeToString(g_updated, TIME_DATE | TIME_MINUTES) + " UTC), robot réactivé.");
+     }
+  }
+
+// Signal de vie : un commentaire dans le ticket GitHub InpBeatIssue toutes les InpBeatMinutes minutes.
+// HEARTBEAT;compte;DÉMO|RÉEL;serveur;version;heure UTC;état;consignes du;idées;équité;devise
+void Heartbeat()
+  {
+   if(InpGitToken == "" || InpBeatIssue <= 0) return;
+   if(g_lastBeat != 0 && TimeLocal() - g_lastBeat < MathMax(15, InpBeatMinutes) * 60) return;
+   g_lastBeat = TimeLocal();
+   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.08;%s;%s;%s;%d;%.2f;%s",
+                              AccountInfoInteger(ACCOUNT_LOGIN),
+                              AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
+                              AccountInfoString(ACCOUNT_SERVER),
+                              TimeToString(TimeGMT(), TIME_DATE | TIME_MINUTES), g_state,
+                              g_updated > 0 ? TimeToString(g_updated, TIME_DATE | TIME_MINUTES) : "jamais",
+                              CountActiveIds(), AccountInfoDouble(ACCOUNT_EQUITY), AccountInfoString(ACCOUNT_CURRENCY));
+   if(!GitSend(line, InpBeatIssue)) g_lastBeat = TimeLocal() - MathMax(15, InpBeatMinutes) * 60 + 300;   // échec : réessai dans 5 min
+  }
+
 void Cycle()
   {
    GlobalVariableSet(LockName(), ChartKey());
@@ -1374,11 +1425,13 @@ void Cycle()
    if(InpDemoOnly && TerminalInfoInteger(TERMINAL_CONNECTED) && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
      {
       Comment("ORACLE : compte RÉEL détecté, robot à l'arrêt (réglage « Démo uniquement »).");
+      g_state = "arrêt : compte réel refusé (Démo uniquement)";
       return;
      }
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
      {
       Comment("ORACLE : activez le bouton « Algo Trading » et l'option « Autoriser le trading algorithmique ».");
+      g_state = "arrêt : Algo Trading désactivé";
       return;
      }
    g_status = "";
@@ -1386,16 +1439,19 @@ void Cycle()
       AccountInfoDouble(ACCOUNT_BALANCE) <= 0 || AccountInfoDouble(ACCOUNT_EQUITY) <= 0)
      {
       Comment("ORACLE : pas connecté au serveur du courtier (ou compte vide). Vérifiez le compte et le serveur dans Fichier > Connexion à un compte de trading. Aucune action.");
+      g_state = "arrêt : pas connecté au courtier";
       return;
      }
    if(GuardsBlock())
      {
       Comment("ORACLE : " + g_status);
+      g_state = "arrêt : " + g_status;
       return;
      }
 
    string txt;
    bool ok = FetchText(txt) && Parse(txt);
+   if(ok) g_lastOk = TimeGMT();
    bool stale = !ok || (TimeGMT() - g_updated > (long)(InpMaxSignalAgeH * 3600));
    bool black = InBlackout();
    int wk = WeekendState();
@@ -1403,6 +1459,8 @@ void Cycle()
    string why = (wk > 0) ? "week-end (fermeture du vendredi " + IntegerToString(InpFridayHour) + "h" + StringFormat("%02d", InpFridayMinute) + ")" :
                 !ok ? "consignes illisibles" : stale ? "consignes trop anciennes" : !g_enabled ? "robot coupé par ORACLE (interrupteur)" : black ? "annonce économique" : "";
    bool allowed = (why == "");
+   g_state = allowed ? "actif" : "en pause : " + why;
+   StaleAlert(ok, stale, wk);
 
    ManagePending(allowed, why);
    ManageBreakEven();
@@ -1421,7 +1479,7 @@ void Cycle()
    int nbias = 0;
    for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
 
-   Comment(StringFormat("ORACLE Executor v1.07 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | Telegram %s | journal %s | %s",
+   Comment(StringFormat("ORACLE Executor v1.08 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
@@ -1465,6 +1523,7 @@ void OnTimer()
   {
    Cycle();
    FlushQueues();
+   Heartbeat();
   }
 
 //+------------------------------------------------------------------+
