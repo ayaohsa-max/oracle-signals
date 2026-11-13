@@ -3,7 +3,11 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.10 – comptes démo et réel                             |
+//|  Version 1.11 – comptes démo et réel                             |
+//|  1.11 : SAV-WS : mesure du passage au prix d'entrée (variante    |
+//|         « BE » notée pour chaque résultat) et option de le faire |
+//|         en réel ; consignes lues sans le cache de 5 min de GitHub|
+//|         quand le jeton GitHub est renseigné.                     |
 //|  1.10 : gestion des anomalies : alerte Telegram au retour d'une  |
 //|         coupure (courtier ou PC/MT5 arrêté) avec sa durée,       |
 //|         alerte en cas de refus du courtier, rattrapage de la     |
@@ -27,7 +31,7 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.10"
+#property version   "1.11"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -97,6 +101,8 @@ input int    InpSwMaxWait       = 100;                  // SAV-WS : validité d'
 input string InpSwKzLondon      = "08:00-11:00";        // SAV-WS : killzone Londres (heure de Paris)
 input string InpSwKzNY          = "13:00-16:00";        // SAV-WS : killzone New York (heure de Paris)
 input string InpSwAsia          = "01:00-06:00";        // SAV-WS : range asiatique (heure de Paris)
+input bool   InpSwBE            = false;                // SAV-WS : en réel, stop remonté au prix d'entrée (à activer seulement si le bilan le valide)
+input double InpSwBeAtR         = 1.0;                  // SAV-WS : gain (en R) à partir duquel le stop passe au prix d'entrée (réel et mesure)
 
 //--- Données
 struct OSignal
@@ -412,10 +418,30 @@ bool FetchText(string &txt)
    char post[], res[];
    string hdr;
    ResetLastError();
-   string url = InpSignalURL;
-   url += (StringFind(url, "?") >= 0) ? "&t=" : "?t=";
-   url += IntegerToString((long)TimeGMT());
-   int code = WebRequest("GET", url, "", 8000, post, res, hdr);
+   int code = -1;
+   // Avec le jeton GitHub : lecture par l'API (pas de cache de 5 minutes), sinon adresse brute
+   string pre = "https://raw.githubusercontent.com/";
+   if(InpGitToken != "" && StringFind(InpSignalURL, pre) == 0)
+     {
+      string parts[];
+      string rest = StringSubstr(InpSignalURL, StringLen(pre));
+      int k = StringSplit(rest, '/', parts);
+      if(k >= 4)
+        {
+         string path = parts[3];
+         for(int j = 4; j < k; j++) path += "/" + parts[j];
+         string api = "https://api.github.com/repos/" + parts[0] + "/" + parts[1] + "/contents/" + path + "?ref=" + parts[2];
+         string h = "Authorization: Bearer " + InpGitToken + "\r\nUser-Agent: ORACLE-EA\r\nAccept: application/vnd.github.raw\r\n";
+         code = WebRequest("GET", api, h, 8000, post, res, hdr);
+        }
+     }
+   if(code != 200)
+     {
+      string url = InpSignalURL;
+      url += (StringFind(url, "?") >= 0) ? "&t=" : "?t=";
+      url += IntegerToString((long)TimeGMT());
+      code = WebRequest("GET", url, "", 8000, post, res, hdr);
+     }
    if(code == 200)
      {
       txt = CharArrayToString(res, 0, WHOLE_ARRAY, CP_UTF8);
@@ -1751,11 +1777,15 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
    double bO = 0, bExt = 0, bEntry = 0, bEL = 0, bSL = 0, bTP = 0, bRR = 0;
    string bConf = "", bLiq = "";
    bool bValid = false, bChoch = false, bMss = false, bKz = false;
+   bool bBeOn = false, bBeOut = false;
+   int  bBeBar = -1;
    // vente
    int sState = 0, sOIdx = -1, sStart = -1, sFill = -1;
    double sO = 0, sExt = 0, sEntry = 0, sEL = 0, sSL = 0, sTP = 0, sRR = 0;
    string sConf = "", sLiq = "";
    bool sValid = false, sChoch = false, sMss = false, sKz = false;
+   bool sBeOn = false, sBeOut = false;
+   int  sBeBar = -1;
 
    for(int t = 1; t <= last; t++)
      {
@@ -1845,7 +1875,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
         {
          if(bValid && r[t].low <= bEntry)
            {
-            bState = 2; bFill = t;
+            bState = 2; bFill = t; bBeOn = false; bBeOut = false; bBeBar = -1;
             if(t == last) Print("ORACLE : SAV-WS ", sym, " ", SwTfName(tf), " achat déclenché à ", DoubleToString(bEntry, dg));
            }
          else if(r[t].high > bExt) { bExt = r[t].high; bEval = true; }
@@ -1879,16 +1909,21 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
         }
       if(bState == 2)
         {
+         double bRisk = MathAbs(bEntry - bSL);
+         // variante « passage à l'entrée » : stop à l'entrée à partir de la bougie qui suit les +InpSwBeAtR R
+         if(bBeOn && !bBeOut && t > bBeBar && r[t].low <= bEntry) bBeOut = true;
+         if(!bBeOn && t > bFill && bRisk > 0 && r[t].high >= bEntry + InpSwBeAtR * bRisk) { bBeOn = true; bBeBar = t; }
          bool hitSL = r[t].low <= bSL;
          bool hitTP = t > bFill && r[t].high >= bTP;
          if(hitSL || hitTP)
            {
             if(t == last)
               {
-               double risk = MathAbs(bEntry - bSL);
-               double R = (hitSL ? -1.0 : bRR) - ((risk > 0) ? spr / risk : 0);
-               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
-                                               hitSL ? "stop" : "objectif", R));
+               double cost = (bRisk > 0) ? spr / bRisk : 0;
+               double R = (hitSL ? -1.0 : bRR) - cost;
+               double Rbe = bBeOut ? -cost : R;
+               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f;%.2f", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R, Rbe));
               }
             bState = 0;
            }
@@ -1914,7 +1949,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
         {
          if(sValid && r[t].high >= sEntry)
            {
-            sState = 2; sFill = t;
+            sState = 2; sFill = t; sBeOn = false; sBeOut = false; sBeBar = -1;
             if(t == last) Print("ORACLE : SAV-WS ", sym, " ", SwTfName(tf), " vente déclenchée à ", DoubleToString(sEntry, dg));
            }
          else if(r[t].low < sExt) { sExt = r[t].low; sEval = true; }
@@ -1948,16 +1983,20 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
         }
       if(sState == 2)
         {
+         double sRisk = MathAbs(sSL - sEntry);
+         if(sBeOn && !sBeOut && t > sBeBar && r[t].high >= sEntry) sBeOut = true;
+         if(!sBeOn && t > sFill && sRisk > 0 && r[t].low <= sEntry - InpSwBeAtR * sRisk) { sBeOn = true; sBeBar = t; }
          bool hitSL = r[t].high >= sSL;
          bool hitTP = t > sFill && r[t].low <= sTP;
          if(hitSL || hitTP)
            {
             if(t == last)
               {
-               double risk = MathAbs(sSL - sEntry);
-               double R = (hitSL ? -1.0 : sRR) - ((risk > 0) ? spr / risk : 0);
-               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
-                                               hitSL ? "stop" : "objectif", R));
+               double cost = (sRisk > 0) ? spr / sRisk : 0;
+               double R = (hitSL ? -1.0 : sRR) - cost;
+               double Rbe = sBeOut ? -cost : R;
+               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f;%.2f", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R, Rbe));
               }
             sState = 0;
            }
@@ -2093,6 +2132,40 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
                        DoubleToString(sl, d), DoubleToString(tp, d), g_swRR[slot], DoubleToString(lot, 2), riskPct, g_swConf[slot]));
   }
 
+//--- En réel (option InpSwBE) : stop d'une position SAV-WS remonté au prix d'entrée à +InpSwBeAtR R
+void SwManageBE()
+  {
+   if(!InpSwBE || InpSwBeAtR <= 0) return;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0) continue;
+      long m = PositionGetInteger(POSITION_MAGIC);
+      if(!IsOurs(m) || !SwIsSw(MagicId(m))) continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl = PositionGetDouble(POSITION_SL), tp = PositionGetDouble(POSITION_TP);
+      bool buy = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+      string rk = GV("swr_" + IntegerToString((long)t));
+      if(!GlobalVariableCheck(rk))
+        {
+         if(sl <= 0) continue;
+         GlobalVariableSet(rk, MathAbs(open - sl));        // risque initial, mémorisé à la première lecture
+        }
+      double risk = GlobalVariableGet(rk);
+      if(risk <= 0) continue;
+      bool already = buy ? (sl >= open) : (sl > 0 && sl <= open);
+      if(already) continue;
+      double px = buy ? SymbolInfoDouble(sym, SYMBOL_BID) : SymbolInfoDouble(sym, SYMBOL_ASK);
+      double minGap = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(sym, SYMBOL_POINT);
+      bool reached = buy ? (px >= open + InpSwBeAtR * risk && px - open > minGap) : (px <= open - InpSwBeAtR * risk && open - px > minGap);
+      if(!reached) continue;
+      g_trade.SetExpertMagicNumber(m);
+      if(g_trade.PositionModify(t, RoundPrice(sym, open), tp))
+         Notify(StringFormat("%s SAV-WS %s : +%.1fR atteint, stop remonté au prix d'entrée.", NumToId(MagicId(m)), sym, InpSwBeAtR));
+     }
+  }
+
 //--- Appelé à chaque cycle
 void SwProcess(bool allowed)
   {
@@ -2148,8 +2221,9 @@ void SwProcess(bool allowed)
                           }
                         else if(f[0] == "RESULT")
                           {
-                           SavJournal(StringFormat("SAVWS_RESULT;%I64d;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
-                                                   asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], SwModeNow() == 2 ? "SIM" : "OBS"));
+                           SavJournal(StringFormat("SAVWS_RESULT;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
+                                                   asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], SwModeNow() == 2 ? "SIM" : "OBS",
+                                                   nf >= 6 ? f[5] : f[4]));
                            if(SwModeNow() == 1 && InpSwNotify)
                               Notify(StringFormat("SAV-WS %s %s %s (observation) : %s, %sR", SwTfName(tf), sym,
                                                   f[1] == "BUY" ? "achat" : "vente", f[3], f[4]));
@@ -2288,7 +2362,7 @@ void Heartbeat()
    if(InpGitToken == "" || InpBeatIssue <= 0) return;
    if(g_lastBeat != 0 && TimeLocal() - g_lastBeat < MathMax(15, InpBeatMinutes) * 60) return;
    g_lastBeat = TimeLocal();
-   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.10;%s;%s;%s;%d;%.2f;%s",
+   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.11;%s;%s;%s;%d;%.2f;%s",
                               AccountInfoInteger(ACCOUNT_LOGIN),
                               AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                               AccountInfoString(ACCOUNT_SERVER),
@@ -2350,6 +2424,7 @@ void Cycle()
 
    ManagePending(allowed, why);
    ManageBreakEven();
+   SwManageBE();
 
    if(allowed)
       for(int i = 0; i < g_nsig; i++)
@@ -2366,7 +2441,7 @@ void Cycle()
    int nbias = 0;
    for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
 
-   Comment(StringFormat("ORACLE Executor v1.10 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
+   Comment(StringFormat("ORACLE Executor v1.11 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
