@@ -8,6 +8,17 @@ import json, sys, urllib.request, datetime, collections
 REPO = "ayaohsa-max/oracle-signals"
 
 def comments(issue):
+    try:
+        return comments_http(issue)
+    except Exception:
+        import subprocess
+        r = subprocess.run(["gh", "api", "--paginate",
+                            f"repos/{REPO}/issues/{issue}/comments?per_page=100"],
+                           capture_output=True, text=True, timeout=120, check=True)
+        txt = r.stdout.replace("][", ",")
+        return json.loads(txt) if txt.strip() else []
+
+def comments_http(issue):
     out, page = [], 1
     while True:
         url = f"https://api.github.com/repos/{REPO}/issues/{issue}/comments?per_page=100&page={page}"
