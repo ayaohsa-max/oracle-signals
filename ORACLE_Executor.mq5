@@ -3,7 +3,11 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.09 – comptes démo et réel                             |
+//|  Version 1.10 – comptes démo et réel                             |
+//|  1.10 : gestion des anomalies : alerte Telegram au retour d'une  |
+//|         coupure (courtier ou PC/MT5 arrêté) avec sa durée,       |
+//|         alerte en cas de refus du courtier, rattrapage de la     |
+//|         fermeture du vendredi si le robot était arrêté.          |
 //|  1.09 : moteur SAV-WS (filtres SAV-AFS + entrée WinStructure) :  |
 //|         ordre limite Fibo 0.618-1 sur confluence (OB, FVG,       |
 //|         liquidité, MSS, Premium/Discount, killzone, zone H4),    |
@@ -23,7 +27,7 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.09"
+#property version   "1.10"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -696,6 +700,17 @@ ENUM_ORDER_TYPE OrderTypeOf(OSignal &s)
 //+------------------------------------------------------------------+
 //| Envoi d'un ordre en attente, confirmé par le serveur             |
 //+------------------------------------------------------------------+
+// Alerte Telegram sur un refus du courtier, au plus une fois par heure pour un même symbole et un même code
+void RefusalAlert(string ctx, string sym)
+  {
+   uint rc = g_trade.ResultRetcode();
+   string key = GV("ref_" + sym + "_" + IntegerToString((int)rc));
+   if(GlobalVariableCheck(key) && TimeGMT() - (datetime)GlobalVariableGet(key) < 3600) return;
+   GlobalVariableSet(key, (double)TimeGMT());
+   Notify(StringFormat("ALERTE : refus du courtier sur %s (%s) : code %d, %s. Vérifier marge, symbole et heures de cotation.",
+                       sym, ctx, (int)rc, g_trade.ResultRetcodeDescription()));
+  }
+
 bool SendPending(string sym, ENUM_ORDER_TYPE ot, double lot, double price, double sl, double tp, long magic, string comment)
   {
    g_trade.SetExpertMagicNumber(magic);
@@ -877,6 +892,7 @@ void PlaceSignal(OSignal &s)
    if(!ok)
      {
       Print("ORACLE : ", s.id, " refus du courtier : ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
+      RefusalAlert("idée " + s.id, sym);
       DeletePending("échec de pose", idnum);
       return;
      }
@@ -1284,6 +1300,7 @@ bool PlaceSavMarket(string asset, string sym, int tfh, SavHit &h)
    if(!ok || (g_trade.ResultRetcode() != TRADE_RETCODE_DONE && g_trade.ResultRetcode() != TRADE_RETCODE_PLACED))
      {
       Print("ORACLE : SAV ", sym, " refus du courtier : ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
+      RefusalAlert("SAV-AFS", sym);
       return false;
      }
    int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
@@ -1386,13 +1403,13 @@ int WeekendState()
 
 void FridayClose()
   {
-   int open = 0;
+   int open = 0, closed = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong t = PositionGetTicket(i);
       if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
       open++;
-      g_trade.PositionClose(t);
+      if(g_trade.PositionClose(t)) closed++;
      }
    MqlDateTime p;
    TimeToStruct(ParisNow(), p);
@@ -1400,7 +1417,11 @@ void FridayClose()
    if(open > 0 && !GlobalVariableCheck(key))
      {
       GlobalVariableSet(key, 1);
-      Notify("fermeture du vendredi : " + IntegerToString(open) + " position(s) fermée(s), pause jusqu'à dimanche 23h.");
+      if(closed == open)
+         Notify("fermeture du vendredi : " + IntegerToString(open) + " position(s) fermée(s), pause jusqu'à dimanche 23h.");
+      else
+         Notify(StringFormat("ALERTE fermeture du vendredi : %d position(s) sur %d pas encore fermée(s) (marché fermé ou refus). Le robot réessaie, puis les fermera à la réouverture.",
+                             open - closed, open));
      }
   }
 
@@ -2062,6 +2083,7 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
    if(!SendPending(sym, ot, lot, e, sl, tp, MakeMagic(idnum, 1), cmt))
      {
       Print("ORACLE : SAV-WS ", sym, " refus du courtier : ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
+      RefusalAlert("SAV-WS " + SwTfName(tf), sym);
       return;
      }
    QueuePushInt(keep, idnum);
@@ -2163,6 +2185,75 @@ int SwCountSlots(int state)
    return c;
   }
 
+//+------------------------------------------------------------------+
+//| Gestion des anomalies (v1.10)                                    |
+//+------------------------------------------------------------------+
+string DiscName()  { return "ORACLE_DISC_"  + IntegerToString(InpMagic); }   // début d'une coupure courtier (GMT)
+string AliveName() { return "ORACLE_ALIVE_" + IntegerToString(InpMagic); }   // dernier signe de vie (GMT), survit à l'arrêt du PC
+
+string ParisHM(datetime utc)
+  {
+   MqlDateTime d;
+   TimeToStruct(utc + ParisOffsetAt(utc), d);
+   return StringFormat("%02d/%02d %02d:%02d", d.day, d.mon, d.hour, d.min);
+  }
+
+string Duree(long mins)
+  {
+   if(mins < 120) return IntegerToString(mins) + " min";
+   if(mins < 2880) return IntegerToString(mins / 60) + " h " + StringFormat("%02d", (int)(mins % 60));
+   return IntegerToString(mins / 1440) + " j " + IntegerToString((mins % 1440) / 60) + " h";
+  }
+
+// Retour de la connexion au courtier après une coupure d'au moins 5 minutes
+void ConnectionCheck()
+  {
+   if(!GlobalVariableCheck(DiscName())) return;
+   datetime from = (datetime)GlobalVariableGet(DiscName());
+   GlobalVariableDel(DiscName());
+   long mins = (long)(TimeGMT() - from) / 60;
+   if(mins >= 5)
+      Notify(StringFormat("connexion au courtier rétablie : coupure du %s au %s (%s). Stops et objectifs sont restés chez le courtier ; le robot reprend normalement.",
+                          ParisHM(from), ParisHM(TimeGMT()), Duree(mins)));
+  }
+
+// Heure UTC de la dernière fermeture du vendredi (InpFridayHour:InpFridayMinute, heure de Paris)
+datetime LastFridayCutUTC()
+  {
+   datetime p = ParisNow();
+   long off = (long)(p - TimeGMT());
+   MqlDateTime d;
+   TimeToStruct(p, d);
+   int back = (d.day_of_week - 5 + 7) % 7;
+   d.hour = InpFridayHour; d.min = InpFridayMinute; d.sec = 0;
+   datetime cut = StructToTime(d) - back * 86400;
+   if(cut > p) cut -= 7 * 86400;
+   return (datetime)(cut - off);
+  }
+
+// Rattrapage : une position ouverte avant la dernière fermeture du vendredi (robot arrêté à ce moment-là) est fermée à la réouverture
+void WeekendCatchUp()
+  {
+   if(!InpFridayClose) return;
+   datetime cutUtc = LastFridayCutUTC();
+   int srvOff = (int)(MathRound((double)(TimeTradeServer() - TimeGMT()) / 1800.0) * 1800);
+   int n = 0, ok = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong t = PositionGetTicket(i);
+      if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
+      datetime openUtc = (datetime)PositionGetInteger(POSITION_TIME) - srvOff;
+      if(openUtc >= cutUtc) continue;
+      n++;
+      if(g_trade.PositionClose(t)) ok++;
+     }
+   if(n == 0 || ok == 0) return;
+   string key = GV("wkc_" + IntegerToString((long)cutUtc));
+   if(GlobalVariableCheck(key)) return;
+   GlobalVariableSet(key, 1);
+   Notify(StringFormat("rattrapage de la fermeture du vendredi : %d position(s) restée(s) ouverte(s) pendant le week-end (robot arrêté vendredi soir) fermée(s) à la réouverture.", ok));
+  }
+
 string LockName() { return "ORACLE_LOCK_" + IntegerToString(InpMagic); }
 string BeatName() { return "ORACLE_BEAT_" + IntegerToString(InpMagic); }
 double ChartKey() { return (double)(ChartID() % 1000000007); }  // tient sans perte dans un double
@@ -2197,7 +2288,7 @@ void Heartbeat()
    if(InpGitToken == "" || InpBeatIssue <= 0) return;
    if(g_lastBeat != 0 && TimeLocal() - g_lastBeat < MathMax(15, InpBeatMinutes) * 60) return;
    g_lastBeat = TimeLocal();
-   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.09;%s;%s;%s;%d;%.2f;%s",
+   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.10;%s;%s;%s;%d;%.2f;%s",
                               AccountInfoInteger(ACCOUNT_LOGIN),
                               AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                               AccountInfoString(ACCOUNT_SERVER),
@@ -2211,6 +2302,9 @@ void Cycle()
   {
    GlobalVariableSet(LockName(), ChartKey());
    GlobalVariableSet(BeatName(), (double)TimeLocal());
+   GlobalVariableSet(AliveName(), (double)TimeGMT());
+   static datetime lastFlush = 0;
+   if(TimeLocal() - lastFlush >= 600) { GlobalVariablesFlush(); lastFlush = TimeLocal(); }   // survit à une coupure de courant
    if(InpDemoOnly && TerminalInfoInteger(TERMINAL_CONNECTED) && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
      {
       Comment("ORACLE : compte RÉEL détecté, robot à l'arrêt (réglage « Démo uniquement »).");
@@ -2229,8 +2323,10 @@ void Cycle()
      {
       Comment("ORACLE : pas connecté au serveur du courtier (ou compte vide). Vérifiez le compte et le serveur dans Fichier > Connexion à un compte de trading. Aucune action.");
       g_state = "arrêt : pas connecté au courtier";
+      if(!GlobalVariableCheck(DiscName())) GlobalVariableSet(DiscName(), (double)TimeGMT());
       return;
      }
+   ConnectionCheck();
    if(GuardsBlock())
      {
       Comment("ORACLE : " + g_status);
@@ -2245,6 +2341,7 @@ void Cycle()
    bool black = InBlackout();
    int wk = WeekendState();
    if(wk == 1) FridayClose();
+   else if(wk == 0) WeekendCatchUp();
    string why = (wk > 0) ? "week-end (fermeture du vendredi " + IntegerToString(InpFridayHour) + "h" + StringFormat("%02d", InpFridayMinute) + ")" :
                 !ok ? "consignes illisibles" : stale ? "consignes trop anciennes" : !g_enabled ? "robot coupé par ORACLE (interrupteur)" : black ? "annonce économique" : "";
    bool allowed = (why == "");
@@ -2269,7 +2366,7 @@ void Cycle()
    int nbias = 0;
    for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
 
-   Comment(StringFormat("ORACLE Executor v1.09 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
+   Comment(StringFormat("ORACLE Executor v1.10 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
@@ -2294,7 +2391,13 @@ int OnInit()
    g_trade.SetDeviationInPoints(30);
    EventSetTimer(MathMax(10, InpPollSeconds));
    LoadVirtual();
-   Notify("robot démarré (compte " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ")");
+   long down = GlobalVariableCheck(AliveName()) ? (long)(TimeGMT() - (datetime)GlobalVariableGet(AliveName())) / 60 : 0;
+   if(down >= 15)
+      Notify(StringFormat("robot relancé (compte %I64d) après un arrêt de %s (dernier signe de vie le %s, heure de Paris : PC éteint, MT5 fermé ou coupure). Stops et objectifs sont restés chez le courtier ; les setups SAV-WS sont recalculés.",
+                          AccountInfoInteger(ACCOUNT_LOGIN), Duree(down), ParisHM((datetime)GlobalVariableGet(AliveName()))));
+   else
+      Notify("robot démarré (compte " + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) + ")");
+   GlobalVariableSet(AliveName(), (double)TimeGMT());
    Cycle();
    return INIT_SUCCEEDED;
   }
