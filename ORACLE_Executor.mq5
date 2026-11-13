@@ -3,7 +3,12 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.08 – comptes démo et réel                             |
+//|  Version 1.09 – comptes démo et réel                             |
+//|  1.09 : moteur SAV-WS (filtres SAV-AFS + entrée WinStructure) :  |
+//|         ordre limite Fibo 0.618-1 sur confluence (OB, FVG,       |
+//|         liquidité, MSS, Premium/Discount, killzone, zone H4),    |
+//|         stop derrière la confluence, objectif Fibo -0.5 ; en     |
+//|         M15 et H1, mode observation ou trading.                  |
 //|  1.08 : signal de vie horaire dans le ticket GitHub n°2, alerte  |
 //|         Telegram quand les consignes sont trop anciennes ou      |
 //|         illisibles (et à la reprise).                           |
@@ -18,7 +23,7 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.08"
+#property version   "1.09"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -66,6 +71,28 @@ input double InpSavAtrMult      = 0.2;                  // SAV-AFS : marge du st
 input double InpSavFibMin       = 0.5;                  // SAV-AFS : début de la zone de retracement
 input double InpSavFibMax       = 0.786;                // SAV-AFS : fin de la zone de retracement
 input int    InpSavMaxBars      = 60;                   // SAV-AFS : durée max d'une étape (bougies)
+input int    InpSwMode          = -1;                   // SAV-WS : -1 = selon ORACLE, 0 = arrêt, 1 = observation, 2 = trading
+input ENUM_TIMEFRAMES InpSwTF1  = PERIOD_M15;           // SAV-WS : unité 1 (Actuelle = désactivée)
+input ENUM_TIMEFRAMES InpSwTF2  = PERIOD_H1;            // SAV-WS : unité 2 (Actuelle = désactivée)
+input ENUM_TIMEFRAMES InpSwHTF  = PERIOD_H4;            // SAV-WS : unité supérieure (tendance, Premium/Discount, zones)
+input bool   InpSwNotify        = true;                 // SAV-WS : Telegram / mobile pour chaque setup en observation
+input int    InpSwPivot         = 5;                    // SAV-WS : longueur des pivots
+input bool   InpSwChoch         = true;                 // SAV-WS : setups aussi sur CHoCH
+input bool   InpSwHtfTrend      = true;                 // SAV-WS : prix du bon côté de la SMA 200 de l'unité supérieure
+input bool   InpSwAlign         = true;                 // SAV-WS : EMA 20 > EMA 50 > SMA 200 (inverse en vente)
+input int    InpSwMinConf       = 2;                    // SAV-WS : confluences minimum (BOS/CHoCH non compté)
+input bool   InpSwNeedKey       = true;                 // SAV-WS : exiger OB, FVG, sweep ou zone de l'unité supérieure
+input bool   InpSwUseMss        = true;                 // SAV-WS : compter le MSS (cassure par bougie de déplacement)
+input double InpSwMssAtr        = 1.0;                  // SAV-WS : MSS = corps de la bougie de cassure >= N x ATR
+input double InpSwMinRR         = 1.5;                  // SAV-WS : gain / risque minimum vers l'objectif
+input double InpSwTarget        = -0.5;                 // SAV-WS : objectif Fibo (0, -0.5 ou -0.618)
+input double InpSwSlAtr         = 0.2;                  // SAV-WS : marge du stop derrière la confluence (x ATR 14)
+input int    InpSwObLook        = 10;                   // SAV-WS : recherche de l'Order Block (bougies avant l'origine)
+input int    InpSwPdLen         = 50;                   // SAV-WS : range Premium/Discount (bougies de l'unité supérieure)
+input int    InpSwMaxWait       = 100;                  // SAV-WS : validité d'un setup (bougies)
+input string InpSwKzLondon      = "08:00-11:00";        // SAV-WS : killzone Londres (heure de Paris)
+input string InpSwKzNY          = "13:00-16:00";        // SAV-WS : killzone New York (heure de Paris)
+input string InpSwAsia          = "01:00-06:00";        // SAV-WS : range asiatique (heure de Paris)
 
 //--- Données
 struct OSignal
@@ -101,6 +128,7 @@ bool     g_staleSent = false; // alerte « consignes » déjà envoyée
 string   g_symCache[];       // symboles dont l'ATR est suivi
 int      g_atrHandle[];
 int      g_savMode  = 1;     // SAV-AFS : 0 = arrêt, 1 = observation, 2 = trading (valeur ORACLE)
+int      g_swMode   = 1;     // SAV-WS : 0 = arrêt, 1 = observation, 2 = trading (valeur ORACLE, 7e champ de HEADER)
 string   g_biasAsset[];      // biais fondamental publié par ORACLE, par actif
 int      g_biasVal[];        // 1 = haussier, -1 = baissier, 0 = neutre
 // signaux SAV-AFS suivis en observation (trades virtuels)
@@ -259,7 +287,7 @@ int IdToNum(string id)
 string NumToId(int num)
   {
    int code = num / 100, n = num % 100;
-   string p = (code == 1) ? "T" : (code == 2) ? "S" : "V";
+   string p = (code == 1) ? "T" : (code == 2) ? "S" : (code == 4) ? "W" : "V";
    return p + StringFormat("%02d", n);
   }
 
@@ -424,6 +452,7 @@ bool Parse(string txt)
          g_risk    = StringToDouble(f[3]);
          g_exitMode = (k >= 5 && f[4] == "1") ? 1 : 0;   // 5e champ facultatif : mode de sortie
          g_savMode  = (k >= 6) ? (int)StringToInteger(f[5]) : 1;   // 6e champ facultatif : mode SAV-AFS
+         g_swMode   = (k >= 7) ? (int)StringToInteger(f[6]) : 1;   // 7e champ facultatif : mode SAV-WS
          hdr = true;
         }
       else if(f[0] == "ORDER" && k >= 10)
@@ -875,6 +904,7 @@ void ManagePending(bool allowed, string why)
       int idnum = MagicId(m);
       string reason = "";
       if(!allowed) reason = why;
+      else if(idnum >= 400 && idnum < 500) continue;     // ordres SAV-WS : tenus par SwProcess
       else
         {
          int k = FindSignal(idnum);
@@ -1374,6 +1404,765 @@ void FridayClose()
      }
   }
 
+//+------------------------------------------------------------------+
+//| SAV-WS : filtres SAV-AFS + entrée WinStructure (version 1.09)    |
+//| Traduction du script TradingView « SAV-WS v3 ».                  |
+//| Déclencheur : BOS ou CHoCH (clôture au-delà du dernier pivot),   |
+//| dans le sens du biais ORACLE, tendance H4 (prix / SMA 200) et    |
+//| alignement EMA 20 / EMA 50 / SMA 200 sur l'unité du signal.      |
+//| Entrée : ordre limite sur le premier niveau Fibo (0.618, 0.705,  |
+//| 0.786, 0.893, 1) qui touche la confluence OB / FVG.              |
+//| Stop : derrière la confluence + 0,2 ATR. Objectif : Fibo -0.5.   |
+//| Confluences comptées : OB, FVG, liquidité (sweep de pivot, PDH / |
+//| PDL ou range asiatique, 1 point), MSS, Premium / Discount,       |
+//| killzone, zone OB / FVG de l'unité supérieure.                   |
+//| Le calcul est rejoué sur l'historique récent à chaque bougie     |
+//| clôturée : aucun état perdu au redémarrage.                      |
+//+------------------------------------------------------------------+
+struct SwRes
+  {
+   int               state;    // dernière bougie clôturée : 0 rien, 1 ordre limite valide, 2 en position
+   bool              buy;
+   double            entry;
+   double            sl;
+   double            tp;
+   double            rr;
+   double            lvl;      // niveau Fibo de l'entrée
+   string            conf;
+  };
+
+int SwModeNow() { return (InpSwMode >= 0) ? InpSwMode : g_swMode; }
+
+void QueuePushLocal(string &q[], string item)
+  {
+   int n = ArraySize(q);
+   ArrayResize(q, n + 1);
+   q[n] = item;
+  }
+
+void QueuePushInt(int &q[], int v)
+  {
+   int n = ArraySize(q);
+   ArrayResize(q, n + 1);
+   q[n] = v;
+  }
+
+void SwReset(SwRes &x)
+  {
+   x.state = 0; x.buy = true; x.entry = 0; x.sl = 0; x.tp = 0; x.rr = 0; x.lvl = 0; x.conf = "";
+  }
+
+// mémoire du dernier calcul, par actif et par unité
+string   g_swKey[];
+datetime g_swBar[];
+int      g_swState[];
+bool     g_swBuy[];
+double   g_swE[];
+double   g_swSL[];
+double   g_swTP[];
+double   g_swRR[];
+double   g_swLvl[];
+string   g_swConf[];
+
+int SwSlot(string key)
+  {
+   int n = ArraySize(g_swKey);
+   for(int i = 0; i < n; i++) if(g_swKey[i] == key) return i;
+   ArrayResize(g_swKey, n + 1); ArrayResize(g_swBar, n + 1); ArrayResize(g_swState, n + 1); ArrayResize(g_swBuy, n + 1);
+   ArrayResize(g_swE, n + 1); ArrayResize(g_swSL, n + 1); ArrayResize(g_swTP, n + 1); ArrayResize(g_swRR, n + 1);
+   ArrayResize(g_swLvl, n + 1); ArrayResize(g_swConf, n + 1);
+   g_swKey[n] = key; g_swBar[n] = 0; g_swState[n] = 0; g_swBuy[n] = true;
+   g_swE[n] = 0; g_swSL[n] = 0; g_swTP[n] = 0; g_swRR[n] = 0; g_swLvl[n] = 0; g_swConf[n] = "";
+   return n;
+  }
+
+string SwTfName(ENUM_TIMEFRAMES tf)
+  {
+   string s = EnumToString(tf);
+   StringReplace(s, "PERIOD_", "");
+   return s;
+  }
+
+double SwFib(double orig, double ext, double lvl) { return ext + lvl * (orig - ext); }
+
+int SwHM(string s)
+  {
+   string p[];
+   if(StringSplit(s, ':', p) < 2) return -1;
+   return (int)StringToInteger(p[0]) * 60 + (int)StringToInteger(p[1]);
+  }
+
+// "08:00-11:00" : vrai si les minutes (heure de Paris) sont dans la plage
+bool SwInSess(int mins, string sess)
+  {
+   string p[];
+   if(StringSplit(sess, '-', p) < 2) return false;
+   int a = SwHM(p[0]), b = SwHM(p[1]);
+   if(a < 0 || b < 0) return false;
+   if(a <= b) return (mins >= a && mins < b);
+   return (mins >= a || mins < b);
+  }
+
+int ParisOffsetAt(datetime utc)
+  {
+   MqlDateTime d;
+   TimeToStruct(utc, d);
+   datetime s = LastSundayUTC(d.year, 3) + 3600;
+   datetime e = LastSundayUTC(d.year, 10) + 3600;
+   return (utc >= s && utc < e) ? 7200 : 3600;
+  }
+
+// minutes de la journée, heure de Paris, pour une heure du serveur du courtier
+int SwParisMinutes(datetime srvTime, int srvOff)
+  {
+   datetime u = srvTime - srvOff;
+   MqlDateTime d;
+   TimeToStruct(u + ParisOffsetAt(u), d);
+   return d.hour * 60 + d.min;
+  }
+
+// ATR de Wilder, EMA 20, EMA 50 et SMA 200 (identiques à ta.atr, ta.ema, ta.sma)
+void SwBase(MqlRates &r[], int n, double &atr[], double &e20[], double &e50[], double &s200[])
+  {
+   ArrayResize(atr, n); ArrayResize(e20, n); ArrayResize(e50, n); ArrayResize(s200, n);
+   double sumTR = 0, sum200 = 0;
+   double a20 = 2.0 / 21.0, a50 = 2.0 / 51.0;
+   for(int i = 0; i < n; i++)
+     {
+      double tr = (i == 0) ? r[i].high - r[i].low :
+                  MathMax(r[i].high - r[i].low, MathMax(MathAbs(r[i].high - r[i - 1].close), MathAbs(r[i].low - r[i - 1].close)));
+      if(i < 14) { sumTR += tr; atr[i] = sumTR / (i + 1); }
+      else atr[i] = (atr[i - 1] * 13.0 + tr) / 14.0;
+      e20[i] = (i == 0) ? r[i].close : a20 * r[i].close + (1 - a20) * e20[i - 1];
+      e50[i] = (i == 0) ? r[i].close : a50 * r[i].close + (1 - a50) * e50[i - 1];
+      sum200 += r[i].close;
+      if(i >= 200) sum200 -= r[i - 200].close;
+      s200[i] = (i >= 199) ? sum200 / 200.0 : 0;
+     }
+  }
+
+void SwPushPivot(double &pp[], int &pi[], double price, int idx)
+  {
+   int n = ArraySize(pp);
+   if(n >= 50)
+     {
+      for(int i = 0; i < n - 1; i++) { pp[i] = pp[i + 1]; pi[i] = pi[i + 1]; }
+      pp[n - 1] = price; pi[n - 1] = idx;
+      return;
+     }
+   ArrayResize(pp, n + 1); ArrayResize(pi, n + 1);
+   pp[n] = price; pi[n] = idx;
+  }
+
+//--- Évaluation d'un setup (dir = 1 achat, -1 vente) : confluences de la zone, entrée, stop, objectif
+void SwEval(MqlRates &r[], int t, int dir, int oIdx, double orig, double ext, double atrV, bool mss,
+            double &pp[], int &pi[],
+            int &cnt, string &txt, bool &keyOk, bool &swOk,
+            double &entry, double &eL, double &sl, double &tp, double &rr, double &zLo, double &zHi)
+  {
+   bool buy = (dir > 0);
+   double rng = MathAbs(ext - orig);
+   double z618 = SwFib(orig, ext, 0.618);
+   zLo = buy ? orig : z618;
+   zHi = buy ? z618 : orig;
+   int oOff = MathMin(t - oIdx, 900);
+   // Order Block : dernière bougie opposée à l'origine de l'impulsion ou juste avant
+   bool obOk = false;
+   double obT = 0, obB = 0;
+   int iMax = MathMin(oOff + InpSwObLook, t);
+   for(int i = oOff; i <= iMax; i++)
+     {
+      int k = t - i;
+      bool opp = buy ? (r[k].close < r[k].open) : (r[k].close > r[k].open);
+      if(opp)
+        {
+         if(r[k].low <= zHi && r[k].high >= zLo) { obOk = true; obT = r[k].high; obB = r[k].low; }
+         break;
+        }
+     }
+   // FVG de l'impulsion qui chevauche la zone 0.618 - 1
+   bool fvOk = false;
+   double fvT = 0, fvB = 0;
+   for(int i = 0; i <= oOff - 2; i++)
+     {
+      int k = t - i;
+      double gT = buy ? r[k].low : r[k - 2].low;
+      double gB = buy ? r[k - 2].high : r[k].high;
+      if(gT > gB && gB <= zHi && gT >= zLo)
+        {
+         bool better = !fvOk || (buy ? gT > fvT : gB < fvB);
+         if(better) { fvOk = true; fvT = gT; fvB = gB; }
+        }
+     }
+   // Sweep : l'origine a pris le dernier pivot opposé
+   swOk = false;
+   for(int j = ArraySize(pp) - 1; j >= 0; j--)
+      if(pi[j] < oIdx) { swOk = buy ? (orig < pp[j]) : (orig > pp[j]); break; }
+   bool mssOk = mss;
+   keyOk = obOk || fvOk || swOk;
+   cnt = (obOk ? 1 : 0) + (fvOk ? 1 : 0) + (swOk ? 1 : 0) + (mssOk ? 1 : 0);
+   string parts = "";
+   if(obOk)  parts += "OB";
+   if(fvOk)  parts += (parts == "" ? "" : "+") + "FVG";
+   if(swOk)  parts += (parts == "" ? "" : "+") + "Sweep";
+   if(mssOk) parts += (parts == "" ? "" : "+") + "MSS";
+   txt = parts;
+   bool hasC = obOk || fvOk;
+   double cTop = (obOk && fvOk) ? MathMax(obT, fvT) : obOk ? obT : fvT;
+   double cBot = (obOk && fvOk) ? MathMin(obB, fvB) : obOk ? obB : fvB;
+   // entrée : premier niveau Fibo qui touche la confluence (sinon 0.705)
+   eL = 0.705;
+   if(hasC)
+     {
+      double lv[5] = {0.618, 0.705, 0.786, 0.893, 1.0};
+      for(int i = 0; i < 5; i++)
+        {
+         double p = SwFib(orig, ext, lv[i]);
+         if(buy ? (p <= cTop) : (p >= cBot)) { eL = lv[i]; break; }
+        }
+     }
+   entry = SwFib(orig, ext, eL);
+   // stop derrière la confluence
+   double buf = InpSwSlAtr * atrV;
+   if(buf <= 0) buf = atrV * 0.01;
+   if(buy)
+     {
+      sl = hasC ? cBot - buf : orig - buf;
+      if(sl >= entry - 0.05 * rng) sl = MathMin(sl, orig - buf);
+     }
+   else
+     {
+      sl = hasC ? cTop + buf : orig + buf;
+      if(sl <= entry + 0.05 * rng) sl = MathMax(sl, orig + buf);
+     }
+   tp = SwFib(orig, ext, InpSwTarget);
+   double risk = MathAbs(entry - sl);
+   rr = (risk > 0) ? (buy ? tp - entry : entry - tp) / risk : 0;
+  }
+
+//--- Rejoue SAV-WS sur l'historique. ev[] reçoit les événements de la dernière bougie clôturée.
+bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, string &ev[])
+  {
+   SwReset(res);
+   ArrayResize(ev, 0);
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   int n = CopyRates(sym, tf, 0, 1000, r);
+   if(n < 300) return false;
+   int last = n - 2;
+   int L = InpSwPivot;
+   int dg = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   double spr = SymbolInfoDouble(sym, SYMBOL_ASK) - SymbolInfoDouble(sym, SYMBOL_BID);
+   if(spr < 0) spr = 0;
+
+   double atr[];
+   double e20[];
+   double e50[];
+   double s200[];
+   SwBase(r, n, atr, e20, e50, s200);
+
+   //--- unité supérieure : tendance, Premium / Discount, zones OB / FVG (bougies clôturées seulement)
+   bool htfOn = PeriodSeconds(InpSwHTF) > PeriodSeconds(tf);
+   MqlRates h[];
+   ArraySetAsSeries(h, false);
+   int m = 0;
+   double hSma[];
+   double hHi[];
+   double hLo[];
+   double zbT[];
+   double zbB[];
+   double zsT[];
+   double zsB[];
+   double obT_[];
+   double obB_[];
+   double osT[];
+   double osB[];
+   if(htfOn)
+     {
+      m = CopyRates(sym, InpSwHTF, 0, 500, h);
+      if(m < 210) return false;
+      ArrayResize(hSma, m); ArrayResize(hHi, m); ArrayResize(hLo, m);
+      ArrayResize(zbT, m); ArrayResize(zbB, m); ArrayResize(zsT, m); ArrayResize(zsB, m);
+      ArrayResize(obT_, m); ArrayResize(obB_, m); ArrayResize(osT, m); ArrayResize(osB, m);
+      double s = 0, bfT = 0, bfB = 0, sfT = 0, sfB = 0, boT = 0, boB = 0, soT = 0, soB = 0;
+      for(int k = 0; k < m; k++)
+        {
+         s += h[k].close;
+         if(k >= 200) s -= h[k - 200].close;
+         hSma[k] = (k >= 199) ? s / 200.0 : 0;
+         double hi = h[k].high, lo = h[k].low;
+         for(int j = MathMax(0, k - InpSwPdLen + 1); j <= k; j++) { hi = MathMax(hi, h[j].high); lo = MathMin(lo, h[j].low); }
+         hHi[k] = (k >= InpSwPdLen - 1) ? hi : 0;
+         hLo[k] = (k >= InpSwPdLen - 1) ? lo : 0;
+         if(k >= 2)
+           {
+            if(h[k].low > h[k - 2].high) { bfT = h[k].low; bfB = h[k - 2].high; }
+            if(h[k].high < h[k - 2].low) { sfT = h[k - 2].low; sfB = h[k].high; }
+            if(h[k].close > h[k - 1].high && h[k - 1].close < h[k - 1].open) { boT = h[k - 1].high; boB = h[k - 1].low; }
+            if(h[k].close < h[k - 1].low && h[k - 1].close > h[k - 1].open) { soT = h[k - 1].high; soB = h[k - 1].low; }
+            if(bfB > 0 && h[k].close < bfB) { bfT = 0; bfB = 0; }
+            if(sfT > 0 && h[k].close > sfT) { sfT = 0; sfB = 0; }
+            if(boB > 0 && h[k].close < boB) { boT = 0; boB = 0; }
+            if(soT > 0 && h[k].close > soT) { soT = 0; soB = 0; }
+           }
+         zbT[k] = bfT; zbB[k] = bfB; zsT[k] = sfT; zsB[k] = sfB;
+         obT_[k] = boT; obB_[k] = boB; osT[k] = soT; osB[k] = soB;
+        }
+     }
+   //--- veille : plus haut / plus bas
+   MqlRates dd[];
+   ArraySetAsSeries(dd, false);
+   int nd = CopyRates(sym, PERIOD_D1, 0, 120, dd);
+
+   //--- état de la structure
+   double lastHigh = 0, lastLow = 0;
+   int lastHighIdx = -1, lastLowIdx = -1, trend = 0;
+   bool highBroken = true, lowBroken = true;
+   double phP[];
+   double plP[];
+   int    phI[];
+   int    plI[];
+   double aH = 0, aL = 0, cAH = 0, cAL = 0;
+   bool prevAsia = false;
+   int kp = 0, dp = 0;
+   // achat
+   int bState = 0, bOIdx = -1, bStart = -1, bFill = -1;
+   double bO = 0, bExt = 0, bEntry = 0, bEL = 0, bSL = 0, bTP = 0, bRR = 0;
+   string bConf = "", bLiq = "";
+   bool bValid = false, bChoch = false, bMss = false, bKz = false;
+   // vente
+   int sState = 0, sOIdx = -1, sStart = -1, sFill = -1;
+   double sO = 0, sExt = 0, sEntry = 0, sEL = 0, sSL = 0, sTP = 0, sRR = 0;
+   string sConf = "", sLiq = "";
+   bool sValid = false, sChoch = false, sMss = false, sKz = false;
+
+   for(int t = 1; t <= last; t++)
+     {
+      //--- sessions (heure de Paris)
+      int pm = SwParisMinutes(r[t].time, srvOff);
+      bool inAsia = SwInSess(pm, InpSwAsia);
+      if(inAsia && !prevAsia) { cAH = r[t].high; cAL = r[t].low; }
+      else if(inAsia) { cAH = MathMax(cAH, r[t].high); cAL = MathMin(cAL, r[t].low); }
+      if(!inAsia && prevAsia) { aH = cAH; aL = cAL; }
+      prevAsia = inAsia;
+      bool inKZ = SwInSess(pm, InpSwKzLondon) || SwInSess(pm, InpSwKzNY);
+
+      //--- unité supérieure : dernière bougie clôturée
+      int k1 = -1;
+      if(htfOn)
+        {
+         while(kp + 1 < m && h[kp + 1].time <= r[t].time) kp++;
+         if(h[kp].time <= r[t].time) k1 = kp - 1;
+        }
+      bool htfBull = !InpSwHtfTrend || !htfOn || (k1 >= 199 && h[k1].close > hSma[k1]);
+      bool htfBear = !InpSwHtfTrend || !htfOn || (k1 >= 199 && h[k1].close < hSma[k1]);
+      double pdMid = 0;
+      if(htfOn) { if(k1 >= 0 && hHi[k1] > 0) pdMid = (hHi[k1] + hLo[k1]) / 2.0; }
+      else if(t > InpSwPdLen)
+        {
+         double hi = r[t - 1].high, lo = r[t - 1].low;
+         for(int j = t - InpSwPdLen; j <= t - 1; j++) { hi = MathMax(hi, r[j].high); lo = MathMin(lo, r[j].low); }
+         pdMid = (hi + lo) / 2.0;
+        }
+      //--- veille
+      double pdh = 0, pdl = 0;
+      if(nd > 1)
+        {
+         while(dp + 1 < nd && dd[dp + 1].time <= r[t].time) dp++;
+         if(dd[dp].time <= r[t].time && dp >= 1) { pdh = dd[dp - 1].high; pdl = dd[dp - 1].low; }
+        }
+
+      //--- pivots confirmés
+      if(t >= 2 * L)
+        {
+         int pb = t - L;
+         if(IsPivotHigh(r, pb, L))
+           {
+            lastHigh = r[pb].high; lastHighIdx = pb; highBroken = false;
+            SwPushPivot(phP, phI, r[pb].high, pb);
+           }
+         if(IsPivotLow(r, pb, L))
+           {
+            lastLow = r[pb].low; lastLowIdx = pb; lowBroken = false;
+            SwPushPivot(plP, plI, r[pb].low, pb);
+           }
+        }
+
+      //--- cassures (clôture)
+      bool bullBreak = !highBroken && lastHighIdx >= 0 && r[t].close > lastHigh;
+      bool bearBreak = !lowBroken && lastLowIdx >= 0 && r[t].close < lastLow;
+      bool bullChoch = bullBreak && trend == -1;
+      bool bearChoch = bearBreak && trend == 1;
+      bool maOk = (t >= 199);
+      bool alBull = !InpSwAlign || (maOk && e20[t] > e50[t] && e50[t] > s200[t]);
+      bool alBear = !InpSwAlign || (maOk && e20[t] < e50[t] && e50[t] < s200[t]);
+      bool canBull = bullBreak && (InpSwChoch || !bullChoch) && bias > 0 && htfBull && alBull;
+      bool canBear = bearBreak && (InpSwChoch || !bearChoch) && bias < 0 && htfBear && alBear;
+      bool bullMss = bullBreak && (r[t].close - r[t].open) >= InpSwMssAtr * atr[t];
+      bool bearMss = bearBreak && (r[t].open - r[t].close) >= InpSwMssAtr * atr[t];
+      int brkHighIdx = lastHighIdx, brkLowIdx = lastLowIdx;
+      if(bullBreak) { highBroken = true; trend = 1; }
+      if(bearBreak) { lowBroken = true; trend = -1; }
+
+      //================= ACHAT =================
+      if(bState == 1 && sState == 2) bState = 0;          // une seule position à la fois
+      bool bEval = false;
+      if(canBull && bState != 2 && sState != 2)
+        {
+         int span = MathMin(t - brkHighIdx, 500);
+         double oLow = r[t].low;
+         int oOff = 0;
+         for(int i = 0; i <= span; i++) if(r[t - i].low < oLow) { oLow = r[t - i].low; oOff = i; }
+         double ext = r[t].high;
+         for(int i = 0; i <= oOff; i++) ext = MathMax(ext, r[t - i].high);
+         bState = 1; bOIdx = t - oOff; bO = oLow; bExt = ext; bStart = t; bValid = false;
+         bChoch = bullChoch; bMss = bullMss; bKz = inKZ;
+         bLiq = (pdl > 0 && oLow < pdl) ? "PDL" : (aL > 0 && oLow < aL) ? "Asie" : "";
+         bEval = true;
+        }
+      else if(bState == 1)
+        {
+         if(bValid && r[t].low <= bEntry)
+           {
+            bState = 2; bFill = t;
+            if(t == last) Print("ORACLE : SAV-WS ", sym, " ", SwTfName(tf), " achat déclenché à ", DoubleToString(bEntry, dg));
+           }
+         else if(r[t].high > bExt) { bExt = r[t].high; bEval = true; }
+         else if(t - bStart > InpSwMaxWait || r[t].low < bO || bearBreak) bState = 0;
+        }
+      if(bEval)
+        {
+         int cnt = 0;
+         string txt = "";
+         bool keyOk = false, swOk = false;
+         double e = 0, eL = 0, sl = 0, tp = 0, rr = 0, zLo = 0, zHi = 0;
+         SwEval(r, t, 1, bOIdx, bO, bExt, atr[t], InpSwUseMss && bMss, plP, plI, cnt, txt, keyOk, swOk, e, eL, sl, tp, rr, zLo, zHi);
+         bool was = bValid;
+         bool pdOk = pdMid > 0 && e < pdMid;
+         bool lqOk = (bLiq != "");
+         bool hzOk = htfOn && k1 >= 0 &&
+                     ((zbT[k1] > 0 && zbT[k1] >= zLo && zbB[k1] <= zHi) || (obT_[k1] > 0 && obT_[k1] >= zLo && obB_[k1] <= zHi));
+         int x = (pdOk ? 1 : 0) + (bKz ? 1 : 0) + (lqOk && !swOk ? 1 : 0) + (hzOk ? 1 : 0);
+         string xs = "";
+         if(pdOk) xs += "Discount";
+         if(bKz)  xs += (xs == "" ? "" : "+") + "KZ";
+         if(lqOk) xs += (xs == "" ? "" : "+") + bLiq;
+         if(hzOk) xs += (xs == "" ? "" : "+") + "ZoneHTF";
+         bEntry = e; bEL = eL; bSL = sl; bTP = tp; bRR = rr;
+         string all = txt + ((txt != "" && xs != "") ? "+" : "") + xs;
+         bConf = (bChoch ? "CHoCH" : "BOS") + (all != "" ? " | " + all : "");
+         bValid = (cnt + x >= InpSwMinConf) && rr >= InpSwMinRR && (keyOk || lqOk || hzOk || !InpSwNeedKey);
+         if(t == last && bValid && !was)
+            QueuePushLocal(ev, StringFormat("SETUP;BUY;%s;%s;%s;%s;%.2f;%.3f;%s", TimeToString(r[t].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                            DoubleToString(e, dg), DoubleToString(sl, dg), DoubleToString(tp, dg), rr, eL, bConf));
+        }
+      if(bState == 2)
+        {
+         bool hitSL = r[t].low <= bSL;
+         bool hitTP = t > bFill && r[t].high >= bTP;
+         if(hitSL || hitTP)
+           {
+            if(t == last)
+              {
+               double risk = MathAbs(bEntry - bSL);
+               double R = (hitSL ? -1.0 : bRR) - ((risk > 0) ? spr / risk : 0);
+               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R));
+              }
+            bState = 0;
+           }
+        }
+
+      //================= VENTE =================
+      if(sState == 1 && bState == 2) sState = 0;
+      bool sEval = false;
+      if(canBear && sState != 2 && bState != 2)
+        {
+         int span = MathMin(t - brkLowIdx, 500);
+         double oHigh = r[t].high;
+         int oOff = 0;
+         for(int i = 0; i <= span; i++) if(r[t - i].high > oHigh) { oHigh = r[t - i].high; oOff = i; }
+         double ext = r[t].low;
+         for(int i = 0; i <= oOff; i++) ext = MathMin(ext, r[t - i].low);
+         sState = 1; sOIdx = t - oOff; sO = oHigh; sExt = ext; sStart = t; sValid = false;
+         sChoch = bearChoch; sMss = bearMss; sKz = inKZ;
+         sLiq = (pdh > 0 && oHigh > pdh) ? "PDH" : (aH > 0 && oHigh > aH) ? "Asie" : "";
+         sEval = true;
+        }
+      else if(sState == 1)
+        {
+         if(sValid && r[t].high >= sEntry)
+           {
+            sState = 2; sFill = t;
+            if(t == last) Print("ORACLE : SAV-WS ", sym, " ", SwTfName(tf), " vente déclenchée à ", DoubleToString(sEntry, dg));
+           }
+         else if(r[t].low < sExt) { sExt = r[t].low; sEval = true; }
+         else if(t - sStart > InpSwMaxWait || r[t].high > sO || bullBreak) sState = 0;
+        }
+      if(sEval)
+        {
+         int cnt = 0;
+         string txt = "";
+         bool keyOk = false, swOk = false;
+         double e = 0, eL = 0, sl = 0, tp = 0, rr = 0, zLo = 0, zHi = 0;
+         SwEval(r, t, -1, sOIdx, sO, sExt, atr[t], InpSwUseMss && sMss, phP, phI, cnt, txt, keyOk, swOk, e, eL, sl, tp, rr, zLo, zHi);
+         bool was = sValid;
+         bool pdOk = pdMid > 0 && e > pdMid;
+         bool lqOk = (sLiq != "");
+         bool hzOk = htfOn && k1 >= 0 &&
+                     ((zsT[k1] > 0 && zsT[k1] >= zLo && zsB[k1] <= zHi) || (osT[k1] > 0 && osT[k1] >= zLo && osB[k1] <= zHi));
+         int x = (pdOk ? 1 : 0) + (sKz ? 1 : 0) + (lqOk && !swOk ? 1 : 0) + (hzOk ? 1 : 0);
+         string xs = "";
+         if(pdOk) xs += "Premium";
+         if(sKz)  xs += (xs == "" ? "" : "+") + "KZ";
+         if(lqOk) xs += (xs == "" ? "" : "+") + sLiq;
+         if(hzOk) xs += (xs == "" ? "" : "+") + "ZoneHTF";
+         sEntry = e; sEL = eL; sSL = sl; sTP = tp; sRR = rr;
+         string all = txt + ((txt != "" && xs != "") ? "+" : "") + xs;
+         sConf = (sChoch ? "CHoCH" : "BOS") + (all != "" ? " | " + all : "");
+         sValid = (cnt + x >= InpSwMinConf) && rr >= InpSwMinRR && (keyOk || lqOk || hzOk || !InpSwNeedKey);
+         if(t == last && sValid && !was)
+            QueuePushLocal(ev, StringFormat("SETUP;SELL;%s;%s;%s;%s;%.2f;%.3f;%s", TimeToString(r[t].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                            DoubleToString(e, dg), DoubleToString(sl, dg), DoubleToString(tp, dg), rr, eL, sConf));
+        }
+      if(sState == 2)
+        {
+         bool hitSL = r[t].high >= sSL;
+         bool hitTP = t > sFill && r[t].low <= sTP;
+         if(hitSL || hitTP)
+           {
+            if(t == last)
+              {
+               double risk = MathAbs(sSL - sEntry);
+               double R = (hitSL ? -1.0 : sRR) - ((risk > 0) ? spr / risk : 0);
+               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R));
+              }
+            sState = 0;
+           }
+        }
+     }
+
+   //--- état final : ordre limite à tenir (le setup le plus récent si les deux sens sont en attente)
+   if(bState == 2 || sState == 2) { res.state = 2; res.buy = (bState == 2); return true; }
+   bool bOk = (bState == 1 && bValid), sOk = (sState == 1 && sValid);
+   if(bOk && (!sOk || bStart >= sStart))
+     { res.state = 1; res.buy = true;  res.entry = bEntry; res.sl = bSL; res.tp = bTP; res.rr = bRR; res.lvl = bEL; res.conf = bConf; }
+   else if(sOk)
+     { res.state = 1; res.buy = false; res.entry = sEntry; res.sl = sSL; res.tp = sTP; res.rr = sRR; res.lvl = sEL; res.conf = sConf; }
+   return true;
+  }
+
+//--- Numéro d'idée W00 à W99 (400 à 499) attribué une fois pour toutes à chaque actif et unité
+int SwIdFor(string sym, ENUM_TIMEFRAMES tf)
+  {
+   string key = GV("swid_" + sym + "_" + SwTfName(tf));
+   if(GlobalVariableCheck(key)) return (int)GlobalVariableGet(key);
+   string pre = GV("swid_");
+   int used[100];
+   ArrayInitialize(used, 0);
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--)
+     {
+      string nm = GlobalVariableName(i);
+      if(StringFind(nm, pre) != 0) continue;
+      int v = (int)GlobalVariableGet(nm) - 400;
+      if(v >= 0 && v < 100) used[v] = 1;
+     }
+   for(int v = 0; v < 100; v++)
+      if(used[v] == 0) { GlobalVariableSet(key, 400 + v); return 400 + v; }
+   return -1;
+  }
+
+bool SwIsSw(int idnum) { return idnum >= 400 && idnum < 500; }
+
+// une position ou un ordre ORACLE en sens inverse existe déjà sur ce symbole
+bool SwOpposite(string sym, bool buy, int idnum)
+  {
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(PositionGetTicket(i) == 0) continue;
+      long mg = PositionGetInteger(POSITION_MAGIC);
+      if(!IsOurs(mg) || MagicId(mg) == idnum || PositionGetString(POSITION_SYMBOL) != sym) continue;
+      bool pb = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+      if(pb != buy) return true;
+     }
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      if(OrderGetTicket(i) == 0) continue;
+      long mg = OrderGetInteger(ORDER_MAGIC);
+      if(!IsOurs(mg) || MagicId(mg) == idnum || OrderGetString(ORDER_SYMBOL) != sym) continue;
+      long ot = OrderGetInteger(ORDER_TYPE);
+      bool ob = (ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP);
+      if(ob != buy) return true;
+     }
+   return false;
+  }
+
+//--- Tient l'ordre limite SAV-WS d'un actif / unité aligné sur le dernier calcul (mode trading)
+void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, int &keep[])
+  {
+   ulong pt = 0;
+   double pE = 0, pSL = 0;
+   long pType = -1;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = OrderGetTicket(i);
+      if(tk == 0) continue;
+      long mg = OrderGetInteger(ORDER_MAGIC);
+      if(IsOurs(mg) && MagicId(mg) == idnum)
+        { pt = tk; pE = OrderGetDouble(ORDER_PRICE_OPEN); pSL = OrderGetDouble(ORDER_SL); pType = OrderGetInteger(ORDER_TYPE); break; }
+     }
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(PositionGetTicket(i) == 0) continue;
+      long mg = PositionGetInteger(POSITION_MAGIC);
+      if(IsOurs(mg) && MagicId(mg) == idnum) return;     // en position : stop et objectif chez le courtier
+     }
+   if(!allowed || g_swState[slot] != 1) return;          // l'ordre éventuel sera retiré par le balayage final
+
+   bool buy = g_swBuy[slot];
+   double e  = RoundPrice(sym, g_swE[slot]);
+   double sl = RoundPrice(sym, g_swSL[slot]);
+   double tp = RoundPrice(sym, g_swTP[slot]);
+   ENUM_ORDER_TYPE ot = buy ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+   double tol = SymbolInfoDouble(sym, SYMBOL_POINT) * 2;
+   if(pt > 0)
+     {
+      if(pType == ot && MathAbs(pE - e) <= tol && MathAbs(pSL - sl) <= tol)
+        {
+         QueuePushInt(keep, idnum);
+         return;
+        }
+      if(!g_trade.OrderDelete(pt)) { QueuePushInt(keep, idnum); return; }
+      Print("ORACLE : ", NumToId(idnum), " SAV-WS ", sym, " niveaux mis à jour, ordre remplacé.");
+     }
+   if(CountActiveIds() >= InpMaxTrades) return;
+   if(SwOpposite(sym, buy, idnum)) return;
+   if(SymbolInfoInteger(sym, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL) return;
+   double bid = SymbolInfoDouble(sym, SYMBOL_BID), ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   if(bid <= 0 || ask <= 0) return;
+   double gap = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(buy ? (ask <= e + gap) : (bid >= e - gap)) return; // le prix est déjà sur l'entrée : pas d'ordre limite possible
+   double dist = MathAbs(e - sl);
+   if(dist <= 0) return;
+   if(InpMaxSpreadPct > 0 && (ask - bid) > dist * InpMaxSpreadPct / 100.0) return;
+
+   double riskPct = MathMin((InpRiskOverride > 0) ? InpRiskOverride : g_risk, InpMaxRiskPct);
+   int streak = LossStreakNow();
+   if(InpLossStreak > 0 && streak >= InpLossStreak) riskPct *= InpStreakFactor;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * riskPct / 100.0;
+   if(InpMaxOpenRiskPct > 0 && OpenRiskMoney() + riskMoney > equity * InpMaxOpenRiskPct / 100.0) return;
+   double pl1 = 0;
+   if(!OrderCalcProfit(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL, sym, 1.0, e, sl, pl1) || pl1 == 0) return;
+   double lot = NormLot(sym, riskMoney / MathAbs(pl1));
+   if(lot <= 0) { Print("ORACLE : SAV-WS ", sym, " capital trop petit pour ce stop."); return; }
+   string id = NumToId(idnum);
+   string cmt = "ORACLE " + id + " SAVWS " + SwTfName(tf);
+   if(!SendPending(sym, ot, lot, e, sl, tp, MakeMagic(idnum, 1), cmt))
+     {
+      Print("ORACLE : SAV-WS ", sym, " refus du courtier : ", g_trade.ResultRetcode(), " ", g_trade.ResultRetcodeDescription());
+      return;
+     }
+   QueuePushInt(keep, idnum);
+   int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+   Notify(StringFormat("%s SAV-WS %s %s %s : ordre limite %s (Fibo %.3f), stop %s, objectif %s (%.1fR), lot %s, risque %.2f %% | %s",
+                       id, SwTfName(tf), sym, buy ? "achat" : "vente", DoubleToString(e, d), g_swLvl[slot],
+                       DoubleToString(sl, d), DoubleToString(tp, d), g_swRR[slot], DoubleToString(lot, 2), riskPct, g_swConf[slot]));
+  }
+
+//--- Appelé à chaque cycle
+void SwProcess(bool allowed)
+  {
+   int keep[];
+   ArrayResize(keep, 0);
+   if(SwModeNow() > 0)
+     {
+      int srvOff = (int)(MathRound((double)(TimeTradeServer() - TimeGMT()) / 1800.0) * 1800);
+      for(int i = 0; i < ArraySize(g_biasAsset); i++)
+        {
+         int bias = g_biasVal[i];
+         if(bias == 0) continue;                          // biais neutre : aucun setup
+         string asset = g_biasAsset[i];
+         string sym = ResolveSymbol(asset);
+         if(sym == "") continue;
+         for(int u = 0; u < 2; u++)
+           {
+            ENUM_TIMEFRAMES tf = (u == 0) ? InpSwTF1 : InpSwTF2;
+            if(tf == PERIOD_CURRENT) continue;
+            int ps = PeriodSeconds(tf);
+            if(ps < 300 || ps > 86400) continue;
+            datetime barT = iTime(sym, tf, 1);
+            if(barT == 0) continue;
+            int idnum = SwIdFor(sym, tf);
+            if(idnum < 0) continue;
+            int slot = SwSlot(sym + "_" + SwTfName(tf));
+            if(g_swBar[slot] != barT)
+              {
+               SwRes res;
+               string ev[];
+               if(SwScan(sym, tf, bias, srvOff, res, ev))
+                 {
+                  g_swBar[slot] = barT;
+                  g_swState[slot] = res.state; g_swBuy[slot] = res.buy; g_swE[slot] = res.entry; g_swSL[slot] = res.sl;
+                  g_swTP[slot] = res.tp; g_swRR[slot] = res.rr; g_swLvl[slot] = res.lvl; g_swConf[slot] = res.conf;
+                  string jk = GV("swj_" + sym + "_" + SwTfName(tf));
+                  if(!GlobalVariableCheck(jk) || (datetime)GlobalVariableGet(jk) != barT)
+                    {
+                     GlobalVariableSet(jk, (double)barT);
+                     string modeTxt = (SwModeNow() == 2) ? "TRADING" : "OBS";
+                     for(int k = 0; k < ArraySize(ev); k++)
+                       {
+                        string f[];
+                        int nf = StringSplit(ev[k], ';', f);
+                        if(nf < 5) continue;
+                        if(f[0] == "SETUP" && nf >= 9)
+                          {
+                           SavJournal(StringFormat("SAVWS_SETUP;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
+                                                   asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], modeTxt));
+                           if(SwModeNow() == 1 && InpSwNotify)
+                              Notify(StringFormat("SAV-WS %s %s %s (observation) : limite %s, stop %s, objectif %s, %sR | %s",
+                                                  SwTfName(tf), sym, f[1] == "BUY" ? "achat" : "vente", f[3], f[4], f[5], f[6], f[8]));
+                          }
+                        else if(f[0] == "RESULT")
+                          {
+                           SavJournal(StringFormat("SAVWS_RESULT;%I64d;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
+                                                   asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], SwModeNow() == 2 ? "SIM" : "OBS"));
+                           if(SwModeNow() == 1 && InpSwNotify)
+                              Notify(StringFormat("SAV-WS %s %s %s (observation) : %s, %sR", SwTfName(tf), sym,
+                                                  f[1] == "BUY" ? "achat" : "vente", f[3], f[4]));
+                          }
+                       }
+                    }
+                 }
+              }
+            if(SwModeNow() == 2) SwSync(sym, tf, idnum, slot, allowed, keep);
+           }
+        }
+     }
+   //--- balayage : retire les ordres SAV-WS qui ne correspondent plus à un setup valide
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = OrderGetTicket(i);
+      if(tk == 0) continue;
+      long mg = OrderGetInteger(ORDER_MAGIC);
+      if(!IsOurs(mg)) continue;
+      int id = MagicId(mg);
+      if(!SwIsSw(id)) continue;
+      bool kept = false;
+      for(int j = 0; j < ArraySize(keep); j++) if(keep[j] == id) kept = true;
+      if(!kept && g_trade.OrderDelete(tk))
+         Print("ORACLE : ordre ", NumToId(id), " SAV-WS annulé (setup terminé, invalidé ou robot en pause).");
+     }
+  }
+
+int SwCountSlots(int state)
+  {
+   int c = 0;
+   for(int i = 0; i < ArraySize(g_swState); i++) if(g_swState[i] == state) c++;
+   return c;
+  }
+
 string LockName() { return "ORACLE_LOCK_" + IntegerToString(InpMagic); }
 string BeatName() { return "ORACLE_BEAT_" + IntegerToString(InpMagic); }
 double ChartKey() { return (double)(ChartID() % 1000000007); }  // tient sans perte dans un double
@@ -1408,7 +2197,7 @@ void Heartbeat()
    if(InpGitToken == "" || InpBeatIssue <= 0) return;
    if(g_lastBeat != 0 && TimeLocal() - g_lastBeat < MathMax(15, InpBeatMinutes) * 60) return;
    g_lastBeat = TimeLocal();
-   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.08;%s;%s;%s;%d;%.2f;%s",
+   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.09;%s;%s;%s;%d;%.2f;%s",
                               AccountInfoInteger(ACCOUNT_LOGIN),
                               AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                               AccountInfoString(ACCOUNT_SERVER),
@@ -1475,16 +2264,18 @@ void Cycle()
         }
 
    SavProcess(allowed);
+   SwProcess(allowed);
    int sm = SavModeNow();
    int nbias = 0;
    for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
 
-   Comment(StringFormat("ORACLE Executor v1.08 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | Telegram %s | journal %s | %s",
+   Comment(StringFormat("ORACLE Executor v1.09 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
                         g_exitMode == 1 ? "ATR" : "BE",
                         sm == 2 ? "trading" : sm == 1 ? "observation" : "arrêt", nbias, ArraySize(g_vSym),
+                        SwModeNow() == 2 ? "trading" : SwModeNow() == 1 ? "observation" : "arrêt", SwCountSlots(1),
                         InpTgToken != "" ? "oui" : "non", InpGitToken != "" ? "GitHub" : "local",
                         allowed ? "actif" : "en pause : " + why));
   }

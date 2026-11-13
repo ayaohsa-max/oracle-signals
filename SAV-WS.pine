@@ -1,0 +1,711 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════
+// SAV-WS — Filtres SAV-AFS (biais, tendance UT supérieure, moyennes)
+//          + entrée WinStructure (structure, Fibo, confluences)
+// Unités de temps : 5 min à 1 jour
+// Fibo : 0 = extrême de l'impulsion, 1 = origine de l'impulsion
+// Entrée : 0.618 / 0.705 / 0.786 / 0.893 / 1 si confluences
+//   (OB, FVG, Sweep, MSS, Premium/Discount, Killzone, PDH/PDL/Asie, zone HTF)
+// Déclencheur : BOS ou CHoCH (non compté). Une seule position à la fois.
+// Stop  : sous la confluence (achat) / au-dessus (vente)
+// Objectifs : 0, -0.5, -0.618
+// Sans repainting : pivots confirmés, alertes à la clôture de bougie
+// ════════════════════════════════════════════════════════════════════
+indicator("SAV-WS — SAV-AFS + WinStructure", shorttitle = "SAV-WS", overlay = true, max_bars_back = 1000, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────── Unités de temps autorisées ─────────
+tfSec = timeframe.in_seconds()
+isTF  = tfSec >= 300 and tfSec <= 86400
+
+// ───────── Réglages ─────────
+G1 = "Structure"
+swingLen  = input.int(5, "Longueur des pivots", minval = 2, maxval = 20, group = G1)
+showSwing = input.bool(true, "Afficher HH / HL / LH / LL", group = G1)
+showBos   = input.bool(true, "Afficher BOS / CHoCH", group = G1)
+useChoch  = input.bool(true, "Setups aussi sur CHoCH", group = G1)
+bullColor = input.color(#26a69a, "Haussier", group = G1, inline = "col")
+bearColor = input.color(#ef5350, "Baissier", group = G1, inline = "col")
+
+G2 = "Fibonacci & entrée"
+useL618   = input.bool(true, "0.618", group = G2, inline = "lv1")
+useL705   = input.bool(true, "0.705", group = G2, inline = "lv1")
+useL786   = input.bool(true, "0.786", group = G2, inline = "lv1")
+useL893   = input.bool(true, "0.893", group = G2, inline = "lv2")
+useL1     = input.bool(true, "1", group = G2, inline = "lv2")
+entryMode = input.string("Auto (confluence)", "Niveau d'entrée", options = ["Auto (confluence)", "0.618", "0.705", "0.786", "0.893", "1"], group = G2, tooltip = "Auto : premier niveau Fibo activé qui touche la confluence (OB / FVG).")
+tpSel     = input.string("-0.5", "Objectif (calcul du R et statistiques)", options = ["0", "-0.5", "-0.618"], group = G2)
+showFib   = input.bool(true, "Afficher les niveaux du setup en cours", group = G2)
+
+G3 = "Confluences & stop"
+useOB    = input.bool(true, "Order Block", group = G3)
+useFVG   = input.bool(true, "Fair Value Gap", group = G3)
+useSweep = input.bool(true, "Liquidity Sweep", group = G3)
+useMSS   = input.bool(true, "MSS (Market Structure Shift)", group = G3, tooltip = "Cassure faite par une bougie de déplacement : corps >= multiplicateur x ATR 14.")
+mssMult  = input.float(1.0, "MSS : corps minimum (x ATR)", minval = 0.1, step = 0.1, group = G3)
+usePD    = input.bool(true, "Premium / Discount (range UT supérieure)", group = G3)
+pdLen    = input.int(50, "Range P/D : nombre de bougies", minval = 10, maxval = 300, group = G3)
+useKZ    = input.bool(true, "Killzones (cassure en session Londres / New York)", group = G3)
+kzLon    = input.session("0800-1100", "Killzone Londres", group = G3)
+kzNY     = input.session("1300-1600", "Killzone New York", group = G3)
+useLiq   = input.bool(true, "Sweep du PDH / PDL ou du range asiatique", group = G3)
+asiaSes  = input.session("0100-0600", "Range asiatique", group = G3)
+useHZ    = input.bool(true, "Zone d'entrée dans un OB / FVG de l'UT supérieure", group = G3)
+minConf  = input.int(2, "Confluences minimum", minval = 0, maxval = 7, group = G3, tooltip = "Comptées : OB, FVG, liquidité (1 point même si plusieurs), MSS, Premium/Discount, Killzone, zone HTF. BOS/CHoCH = déclencheur, non compté.")
+needKey  = input.bool(true, "Exiger une zone ou une liquidité (OB, FVG, Sweep, PDH/PDL/Asie, zone HTF)", group = G3)
+obLook   = input.int(10, "Recherche de l'OB (bougies avant l'origine)", minval = 1, maxval = 50, group = G3)
+slBuf    = input.float(0.2, "Marge du stop (x ATR 14)", minval = 0, step = 0.05, group = G3)
+costPx   = input.float(0.0, "Coût par trade (spread + commission, en prix)", minval = 0, step = 0.01, group = G3, tooltip = "Ex. XAUUSD : 0.30 à 0.50. Déduit de chaque résultat en R.")
+minRR    = input.float(1.5, "R minimum vers l'objectif", minval = 0, step = 0.1, group = G3)
+maxWait  = input.int(100, "Validité du setup (bougies)", minval = 5, maxval = 500, group = G3)
+
+G4 = "Filtres SAV-AFS"
+bias     = input.string("Aucun (les deux sens)", "Biais fondamental", options = ["Aucun (les deux sens)", "Haussier (achats seulement)", "Baissier (ventes seulement)", "Neutre (aucun trade)"], group = G4, tooltip = "Reporte ici le biais ORACLE de l'actif.")
+useHTF   = input.bool(true, "Tendance unité supérieure (prix vs SMA lente)", group = G4)
+htfTF    = input.timeframe("240", "Unité supérieure", group = G4)
+useAlign = input.bool(true, "Alignement EMA 20 > EMA 50 > SMA lente (inverse en vente)", group = G4)
+maLen    = input.int(200, "Période SMA lente", minval = 10, group = G4)
+useSess  = input.bool(false, "Trader seulement pendant la session", group = G4)
+sess     = input.session("0800-1700", "Horaires de session", group = G4)
+sessTZ   = input.string("Europe/Paris", "Fuseau horaire", group = G4)
+
+G5 = "Affichage & alertes"
+showLabels = input.bool(true, "Étiquettes des setups", group = G5)
+showTrades = input.bool(true, "Boîtes risque / objectif des trades", group = G5)
+showStats  = input.bool(true, "Tableau de statistiques", group = G5)
+alertOn    = input.bool(true, "Alertes (setup, entrée, résultat)", group = G5)
+
+tpL = tpSel == "0" ? 0.0 : tpSel == "-0.5" ? -0.5 : -0.618
+atr = ta.atr(14)
+ma    = ta.sma(close, maLen)
+ema20 = ta.ema(close, 20)
+ema50 = ta.ema(close, 50)
+htfOn = useHTF and timeframe.in_seconds(htfTF) > tfSec
+[hC, hM] = request.security(syminfo.tickerid, htfTF, [close[1], ta.sma(close, maLen)[1]], lookahead = barmerge.lookahead_on)
+htfBull  = not htfOn or hC > hM
+htfBear  = not htfOn or hC < hM
+alBull   = not useAlign or (ema20 > ema50 and ema50 > ma)
+alBear   = not useAlign or (ema20 < ema50 and ema50 < ma)
+inSess   = not useSess or not na(time(timeframe.period, sess, sessTZ))
+biasBuy  = bias == "Aucun (les deux sens)" or bias == "Haussier (achats seulement)"
+biasSell = bias == "Aucun (les deux sens)" or bias == "Baissier (ventes seulement)"
+
+// ───────── Pivots ─────────
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastHigh    = na
+var int   lastHighIdx = na
+var bool  highBroken  = true
+var float lastLow     = na
+var int   lastLowIdx  = na
+var bool  lowBroken   = true
+var int   trend       = 0
+var array<float> phP = array.new<float>()
+var array<int>   phI = array.new<int>()
+var array<float> plP = array.new<float>()
+var array<int>   plI = array.new<int>()
+
+// ───────── Fonctions ─────────
+f_fib(float orig, float ext, float lvl) =>
+    ext + lvl * (orig - ext)
+
+f_lvlOn(float lvl) =>
+    lvl == 0.618 ? useL618 : lvl == 0.705 ? useL705 : lvl == 0.786 ? useL786 : lvl == 0.893 ? useL893 : useL1
+
+f_clear(array<line> ls, array<box> bs, array<label> lbs) =>
+    for x in ls
+        line.delete(x)
+    array.clear(ls)
+    for x in bs
+        box.delete(x)
+    array.clear(bs)
+    for x in lbs
+        label.delete(x)
+    array.clear(lbs)
+
+f_bullEval(int oIdx, float oLow, float ext, float atrV, bool brkChoch, bool brkMss) =>
+    rng  = ext - oLow
+    zTop = f_fib(oLow, ext, 0.618)
+    oOff = math.min(bar_index - oIdx, 900)
+    // Order Block : dernière bougie baissière à l'origine ou juste avant
+    float obT = na
+    float obB = na
+    if useOB
+        for i = oOff to math.min(oOff + obLook, bar_index)
+            if close[i] < open[i]
+                if low[i] <= zTop and high[i] >= oLow
+                    obT := high[i]
+                    obB := low[i]
+                break
+    // FVG haussier dans l'impulsion qui chevauche la zone 0.618 - 1
+    float fvT = na
+    float fvB = na
+    if useFVG and oOff >= 2
+        for i = 0 to oOff - 2
+            gT = low[i]
+            gB = high[i + 2]
+            if gT > gB and gB <= zTop and gT >= oLow
+                if na(fvT) or gT > fvT
+                    fvT := gT
+                    fvB := gB
+    // Sweep : l'origine a pris le dernier creux
+    bool swOk = false
+    if useSweep
+        n = array.size(plP)
+        if n > 0
+            for j = n - 1 to 0
+                if array.get(plI, j) < oIdx
+                    swOk := oLow < array.get(plP, j)
+                    break
+    obOk  = not na(obT)
+    fvgOk = not na(fvT)
+    mssOk = useMSS and brkMss
+    keyOk = obOk or fvgOk or swOk
+    cnt   = (obOk ? 1 : 0) + (fvgOk ? 1 : 0) + (swOk ? 1 : 0) + (mssOk ? 1 : 0)
+    parts = array.new<string>()
+    if obOk
+        array.push(parts, "OB")
+    if fvgOk
+        array.push(parts, "FVG")
+    if swOk
+        array.push(parts, "Sweep")
+    if mssOk
+        array.push(parts, "MSS")
+    txt  = (brkChoch ? "CHoCH" : "BOS") + (cnt > 0 ? " | " + array.join(parts, "+") : "")
+    cTop = obOk and fvgOk ? math.max(obT, fvT) : obOk ? obT : fvT
+    cBot = obOk and fvgOk ? math.min(obB, fvB) : obOk ? obB : fvB
+    // Niveau d'entrée
+    float eL = na
+    if entryMode == "Auto (confluence)"
+        if not na(cTop)
+            lv = array.from(0.618, 0.705, 0.786, 0.893, 1.0)
+            for l in lv
+                if f_lvlOn(l) and f_fib(oLow, ext, l) <= cTop
+                    eL := l
+                    break
+        if na(eL)
+            eL := 0.705
+    else
+        eL := str.tonumber(entryMode)
+    entry = f_fib(oLow, ext, eL)
+    // Stop sous la confluence
+    buf = math.max(slBuf * atrV, syminfo.mintick)
+    float sl = na(cBot) ? oLow - buf : cBot - buf
+    if sl >= entry - 0.05 * rng
+        sl := math.min(sl, oLow - buf)
+    tp = f_fib(oLow, ext, tpL)
+    rr = (tp - entry) / (entry - sl)
+    [cnt, txt, entry, eL, sl, tp, rr, obT, obB, fvT, fvB, keyOk]
+
+f_bearEval(int oIdx, float oHigh, float ext, float atrV, bool brkChoch, bool brkMss) =>
+    rng  = oHigh - ext
+    zBot = f_fib(oHigh, ext, 0.618)
+    oOff = math.min(bar_index - oIdx, 900)
+    // Order Block : dernière bougie haussière à l'origine ou juste avant
+    float obT = na
+    float obB = na
+    if useOB
+        for i = oOff to math.min(oOff + obLook, bar_index)
+            if close[i] > open[i]
+                if high[i] >= zBot and low[i] <= oHigh
+                    obT := high[i]
+                    obB := low[i]
+                break
+    // FVG baissier dans l'impulsion qui chevauche la zone 0.618 - 1
+    float fvT = na
+    float fvB = na
+    if useFVG and oOff >= 2
+        for i = 0 to oOff - 2
+            gB = high[i]
+            gT = low[i + 2]
+            if gB < gT and gT >= zBot and gB <= oHigh
+                if na(fvB) or gB < fvB
+                    fvT := gT
+                    fvB := gB
+    // Sweep : l'origine a pris le dernier sommet
+    bool swOk = false
+    if useSweep
+        n = array.size(phP)
+        if n > 0
+            for j = n - 1 to 0
+                if array.get(phI, j) < oIdx
+                    swOk := oHigh > array.get(phP, j)
+                    break
+    obOk  = not na(obT)
+    fvgOk = not na(fvT)
+    mssOk = useMSS and brkMss
+    keyOk = obOk or fvgOk or swOk
+    cnt   = (obOk ? 1 : 0) + (fvgOk ? 1 : 0) + (swOk ? 1 : 0) + (mssOk ? 1 : 0)
+    parts = array.new<string>()
+    if obOk
+        array.push(parts, "OB")
+    if fvgOk
+        array.push(parts, "FVG")
+    if swOk
+        array.push(parts, "Sweep")
+    if mssOk
+        array.push(parts, "MSS")
+    txt  = (brkChoch ? "CHoCH" : "BOS") + (cnt > 0 ? " | " + array.join(parts, "+") : "")
+    cTop = obOk and fvgOk ? math.max(obT, fvT) : obOk ? obT : fvT
+    cBot = obOk and fvgOk ? math.min(obB, fvB) : obOk ? obB : fvB
+    float eL = na
+    if entryMode == "Auto (confluence)"
+        if not na(cBot)
+            lv = array.from(0.618, 0.705, 0.786, 0.893, 1.0)
+            for l in lv
+                if f_lvlOn(l) and f_fib(oHigh, ext, l) >= cBot
+                    eL := l
+                    break
+        if na(eL)
+            eL := 0.705
+    else
+        eL := str.tonumber(entryMode)
+    entry = f_fib(oHigh, ext, eL)
+    // Stop au-dessus de la confluence
+    buf = math.max(slBuf * atrV, syminfo.mintick)
+    float sl = na(cTop) ? oHigh + buf : cTop + buf
+    if sl <= entry + 0.05 * rng
+        sl := math.max(sl, oHigh + buf)
+    tp = f_fib(oHigh, ext, tpL)
+    rr = (entry - tp) / (sl - entry)
+    [cnt, txt, entry, eL, sl, tp, rr, obT, obB, fvT, fvB, keyOk]
+
+f_draw(array<line> ls, array<box> bs, array<label> lbs, int oIdx, float orig, float ext, float eL, float sl, float obT, float obB, float fvT, float fvB, color col) =>
+    x2 = bar_index + 20
+    if showFib
+        lv = array.from(0.0, 0.236, 0.5, 0.618, 0.705, 0.786, 0.893, 1.0, -0.5, -0.618)
+        for l in lv
+            p = f_fib(orig, ext, l)
+            c = l == eL ? col : l < 0 ? color.new(col, 30) : l >= 0.618 ? color.new(color.gray, 10) : color.new(color.gray, 55)
+            array.push(ls, line.new(oIdx, p, x2, p, color = c, width = l == eL ? 2 : 1))
+            array.push(lbs, label.new(x2, p, text = str.tostring(l) + " (" + str.tostring(p, format.mintick) + ")", style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = size.tiny))
+        array.push(ls, line.new(oIdx, sl, x2, sl, color = color.red, style = line.style_dotted, width = 2))
+        array.push(lbs, label.new(x2, sl, text = "SL (" + str.tostring(sl, format.mintick) + ")", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.red, size = size.tiny))
+    if not na(obT)
+        array.push(bs, box.new(oIdx, obT, x2, obB, border_color = color.new(col, 40), bgcolor = color.new(col, 85), text = "OB", text_color = col, text_size = size.small, text_halign = text.align_left))
+    if not na(fvT)
+        array.push(bs, box.new(oIdx, fvT, x2, fvB, border_color = color.new(color.orange, 40), bgcolor = color.new(color.orange, 88), text = "FVG", text_color = color.orange, text_size = size.small, text_halign = text.align_left))
+
+f_msg(string side, float entry, float eL, float sl, float tp, float rr, string conf) =>
+    "SAV-WS " + side + " " + syminfo.ticker + " " + timeframe.period + " | " + conf + " | entrée " + str.tostring(entry, format.mintick) + " (" + str.tostring(eL) + ") | SL " + str.tostring(sl, format.mintick) + " | TP " + str.tostring(tp, format.mintick) + " | " + str.tostring(rr, "#.##") + "R" + "\nSAVWS;" + (side == "ACHAT" ? "BUY" : "SELL") + ";" + syminfo.ticker + ";" + timeframe.period + ";" + str.tostring(entry, format.mintick) + ";" + str.tostring(sl, format.mintick) + ";" + str.tostring(tp, format.mintick) + ";" + conf
+
+// ───────── Confluences supplémentaires ─────────
+f_htfZones() =>
+    var float bfT = na
+    var float bfB = na
+    var float sfT = na
+    var float sfB = na
+    var float boT = na
+    var float boB = na
+    var float soT = na
+    var float soB = na
+    if low > high[2]
+        bfT := low
+        bfB := high[2]
+    if high < low[2]
+        sfT := low[2]
+        sfB := high
+    if close > high[1] and close[1] < open[1]
+        boT := high[1]
+        boB := low[1]
+    if close < low[1] and close[1] > open[1]
+        soT := high[1]
+        soB := low[1]
+    if not na(bfB) and close < bfB
+        bfT := na
+        bfB := na
+    if not na(sfT) and close > sfT
+        sfT := na
+        sfB := na
+    if not na(boB) and close < boB
+        boT := na
+        boB := na
+    if not na(soT) and close > soT
+        soT := na
+        soB := na
+    [bfT[1], bfB[1], sfT[1], sfB[1], boT[1], boB[1], soT[1], soB[1]]
+
+hzOn = timeframe.in_seconds(htfTF) > tfSec
+[hbfT, hbfB, hsfT, hsfB, hboT, hboB, hsoT, hsoB] = request.security(syminfo.tickerid, htfTF, f_htfZones(), lookahead = barmerge.lookahead_on)
+
+// Premium / Discount : milieu du range de l'UT supérieure (ou de l'UT du graphique)
+[rHiH, rLoH] = request.security(syminfo.tickerid, htfTF, [ta.highest(high, pdLen)[1], ta.lowest(low, pdLen)[1]], lookahead = barmerge.lookahead_on)
+rHiC  = ta.highest(high, pdLen)[1]
+rLoC  = ta.lowest(low, pdLen)[1]
+pdMid = hzOn ? (rHiH + rLoH) / 2 : (rHiC + rLoC) / 2
+
+// Killzones
+inKZ = not na(time(timeframe.period, kzLon, sessTZ)) or not na(time(timeframe.period, kzNY, sessTZ))
+
+// Plus haut / plus bas de la veille
+[pdh, pdl] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+// Range asiatique (dernier terminé)
+inAsia = not na(time(timeframe.period, asiaSes, sessTZ))
+var float aH  = na
+var float aL  = na
+var float cAH = na
+var float cAL = na
+if inAsia and not inAsia[1]
+    cAH := high
+    cAL := low
+else if inAsia
+    cAH := math.max(cAH, high)
+    cAL := math.min(cAL, low)
+if not inAsia and inAsia[1]
+    aH := cAH
+    aL := cAL
+
+// ───────── Mise à jour des pivots et étiquettes ─────────
+if not na(ph)
+    idx = bar_index - swingLen
+    if showSwing
+        isHH = na(lastHigh) or ph > lastHigh
+        label.new(idx, ph, text = na(lastHigh) ? "H" : isHH ? "HH" : "LH", style = label.style_label_down, color = color.new(color.black, 100), textcolor = isHH ? bullColor : bearColor, size = size.small)
+    lastHigh    := ph
+    lastHighIdx := idx
+    highBroken  := false
+    array.push(phP, ph)
+    array.push(phI, idx)
+    if array.size(phP) > 50
+        array.shift(phP)
+        array.shift(phI)
+
+if not na(pl)
+    idx = bar_index - swingLen
+    if showSwing
+        isHL = na(lastLow) or pl > lastLow
+        label.new(idx, pl, text = na(lastLow) ? "L" : isHL ? "HL" : "LL", style = label.style_label_up, color = color.new(color.black, 100), textcolor = isHL ? bullColor : bearColor, size = size.small)
+    lastLow    := pl
+    lastLowIdx := idx
+    lowBroken  := false
+    array.push(plP, pl)
+    array.push(plI, idx)
+    if array.size(plP) > 50
+        array.shift(plP)
+        array.shift(plI)
+
+// ───────── Cassures de structure (clôture) ─────────
+bullBreak = not highBroken and not na(lastHigh) and close > lastHigh
+bearBreak = not lowBroken and not na(lastLow) and close < lastLow
+bullChoch = bullBreak and trend == -1
+bearChoch = bearBreak and trend == 1
+canBull   = bullBreak and isTF and (useChoch or not bullChoch) and biasBuy and htfBull and alBull and inSess
+canBear   = bearBreak and isTF and (useChoch or not bearChoch) and biasSell and htfBear and alBear and inSess
+
+// Indices et prix des pivots cassés (avant mise à jour)
+bullMss = bullBreak and close - open >= mssMult * atr
+bearMss = bearBreak and open - close >= mssMult * atr
+
+brkHighIdx = lastHighIdx
+brkLowIdx  = lastLowIdx
+
+if bullBreak
+    highBroken := true
+    if showBos
+        line.new(lastHighIdx, lastHigh, bar_index, lastHigh, color = bullColor, style = line.style_dashed)
+        label.new(math.round((lastHighIdx + bar_index) / 2.0), lastHigh, text = bullChoch ? "CHoCH" : "BOS", style = label.style_label_down, color = color.new(color.black, 100), textcolor = bullColor, size = size.small)
+    trend := 1
+
+if bearBreak
+    lowBroken := true
+    if showBos
+        line.new(lastLowIdx, lastLow, bar_index, lastLow, color = bearColor, style = line.style_dashed)
+        label.new(math.round((lastLowIdx + bar_index) / 2.0), lastLow, text = bearChoch ? "CHoCH" : "BOS", style = label.style_label_up, color = color.new(color.black, 100), textcolor = bearColor, size = size.small)
+    trend := -1
+
+// ───────── Statistiques ─────────
+var int   nTr  = 0
+var int   nWin = 0
+var float sumR = 0.0
+var float gW   = 0.0
+var float gL   = 0.0
+var float eqR  = 0.0
+var float pkR  = 0.0
+var float ddR  = 0.0
+
+var int    sState = 0      // déclaré ici pour bloquer les positions opposées
+
+// ════════════════════ SETUPS ACHAT ════════════════════
+var int    bState = 0      // 0 rien | 1 attente du retracement | 2 en position
+var int    bOIdx  = na
+var float  bO     = na
+var float  bExt   = na
+var int    bStart = na
+var int    bFill  = na
+var float  bEntry = na
+var float  bEL    = na
+var float  bSL    = na
+var float  bTP    = na
+var float  bRR    = na
+var string bConf  = ""
+var bool   bValid = false
+var bool   bChoch = false
+var bool   bMss   = false
+var bool   bKz    = false
+var string bLiq   = ""
+var array<line>  bLines = array.new<line>()
+var array<box>   bBoxes = array.new<box>()
+var array<label> bLabs  = array.new<label>()
+var label  bTag   = na
+
+// Une seule position à la fois : un achat en attente est annulé si une vente est déclenchée
+if bState == 1 and sState == 2
+    f_clear(bLines, bBoxes, bLabs)
+    label.delete(bTag)
+    bState := 0
+
+bEvalNow = false
+if canBull and bState != 2 and sState != 2
+    span = math.min(bar_index - brkHighIdx, 500)
+    oLow = low
+    oOff = 0
+    for i = 0 to span
+        if low[i] < oLow
+            oLow := low[i]
+            oOff := i
+    ext = high
+    for i = 0 to oOff
+        ext := math.max(ext, high[i])
+    f_clear(bLines, bBoxes, bLabs)
+    label.delete(bTag)
+    bState   := 1
+    bOIdx    := bar_index - oOff
+    bO       := oLow
+    bExt     := ext
+    bStart   := bar_index
+    bValid   := false
+    bChoch   := bullChoch
+    bMss     := bullMss
+    bKz      := inKZ
+    bLiq     := not na(pdl) and oLow < pdl ? "PDL" : not na(aL) and oLow < aL ? "Asie" : ""
+    bEvalNow := true
+else if bState == 1
+    if bValid and low <= bEntry
+        bState := 2
+        bFill  := bar_index
+        if alertOn
+            alert("ENTRÉE " + f_msg("ACHAT", bEntry, bEL, bSL, bTP, bRR, bConf), alert.freq_once_per_bar_close)
+    else if high > bExt
+        bExt     := high
+        bEvalNow := true
+    else if bar_index - bStart > maxWait or low < bO or bearBreak
+        f_clear(bLines, bBoxes, bLabs)
+        label.delete(bTag)
+        bState := 0
+
+if bEvalNow
+    [eCnt, eConf, eEntry, eEL, eSL, eTP, eRR, eObT, eObB, eFvT, eFvB, eKey] = f_bullEval(bOIdx, bO, bExt, atr, bChoch, bMss)
+    wasValid = bValid
+    bEntry := eEntry
+    bEL    := eEL
+    bSL    := eSL
+    bTP    := eTP
+    bRR    := eRR
+    bConf  := eConf
+    z618b  = f_fib(bO, bExt, 0.618)
+    pdOk   = usePD and not na(pdMid) and eEntry < pdMid
+    kzOk   = useKZ and bKz
+    lqOk   = useLiq and bLiq != ""
+    hzOk   = useHZ and hzOn and ((not na(hbfT) and hbfT >= bO and hbfB <= z618b) or (not na(hboT) and hboT >= bO and hboB <= z618b))
+    xParts = array.new<string>()
+    if pdOk
+        array.push(xParts, "Discount")
+    if kzOk
+        array.push(xParts, "KZ")
+    if lqOk
+        array.push(xParts, bLiq)
+    if hzOk
+        array.push(xParts, "ZoneHTF")
+    int xCnt = array.size(xParts)
+    xCnt  -= lqOk and str.contains(eConf, "Sweep") ? 1 : 0
+    bConf  := array.size(xParts) > 0 ? eConf + (eCnt > 0 ? "+" : " | ") + array.join(xParts, "+") : eConf
+    bValid := eCnt + xCnt >= minConf and eRR >= minRR and (eKey or lqOk or hzOk or not needKey)
+    f_clear(bLines, bBoxes, bLabs)
+    label.delete(bTag)
+    if bValid
+        f_draw(bLines, bBoxes, bLabs, bOIdx, bO, bExt, bEL, bSL, eObT, eObB, eFvT, eFvB, bullColor)
+        if showLabels
+            bTag := label.new(bOIdx, bO, text = "ACHAT " + bConf + "\nE " + str.tostring(bEntry, format.mintick) + " (" + str.tostring(bEL) + ") | " + str.tostring(bRR, "#.#") + "R", style = label.style_label_up, color = color.new(bullColor, 20), textcolor = color.white, size = size.small)
+        if alertOn and not wasValid
+            alert("SETUP " + f_msg("ACHAT", bEntry, bEL, bSL, bTP, bRR, bConf), alert.freq_once_per_bar_close)
+
+if bState == 2
+    hitSL = low <= bSL
+    hitTP = bar_index > bFill and high >= bTP
+    if hitSL or hitTP
+        cR = costPx / math.max(bEntry - bSL, syminfo.mintick)
+        r  = (hitSL ? -1.0 : bRR) - cR
+        nTr  += 1
+        nWin += r > 0 ? 1 : 0
+        sumR += r
+        gW   += math.max(r, 0)
+        gL   += math.max(-r, 0)
+        eqR  += r
+        pkR  := math.max(pkR, eqR)
+        ddR  := math.max(ddR, pkR - eqR)
+        if showTrades
+            box.new(bFill, bEntry, bar_index, bSL, border_color = color.new(color.red, 60), bgcolor = color.new(color.red, 85))
+            box.new(bFill, bTP, bar_index, bEntry, border_color = color.new(color.green, 60), bgcolor = color.new(color.green, 85))
+            label.new(bar_index, hitSL ? bSL : bTP, text = (r > 0 ? "+" : "") + str.tostring(r, "#.##") + "R", style = hitSL ? label.style_label_up : label.style_label_down, color = hitSL ? color.red : color.green, textcolor = color.white, size = size.small)
+        if alertOn
+            alert((hitSL ? "STOP " : "OBJECTIF ") + "ACHAT " + syminfo.ticker + " " + timeframe.period + " | " + str.tostring(r, "#.##") + "R", alert.freq_once_per_bar_close)
+        f_clear(bLines, bBoxes, bLabs)
+        bTag   := na
+        bState := 0
+
+// ════════════════════ SETUPS VENTE ════════════════════
+var int    sOIdx  = na
+var float  sO     = na
+var float  sExt   = na
+var int    sStart = na
+var int    sFill  = na
+var float  sEntry = na
+var float  sEL    = na
+var float  sSL    = na
+var float  sTP    = na
+var float  sRR    = na
+var string sConf  = ""
+var bool   sValid = false
+var bool   sChoch = false
+var bool   sMss   = false
+var bool   sKz    = false
+var string sLiq   = ""
+var array<line>  sLines = array.new<line>()
+var array<box>   sBoxes = array.new<box>()
+var array<label> sLabs  = array.new<label>()
+var label  sTag   = na
+
+if sState == 1 and bState == 2
+    f_clear(sLines, sBoxes, sLabs)
+    label.delete(sTag)
+    sState := 0
+
+sEvalNow = false
+if canBear and sState != 2 and bState != 2
+    span = math.min(bar_index - brkLowIdx, 500)
+    oHigh = high
+    oOff  = 0
+    for i = 0 to span
+        if high[i] > oHigh
+            oHigh := high[i]
+            oOff  := i
+    ext = low
+    for i = 0 to oOff
+        ext := math.min(ext, low[i])
+    f_clear(sLines, sBoxes, sLabs)
+    label.delete(sTag)
+    sState   := 1
+    sOIdx    := bar_index - oOff
+    sO       := oHigh
+    sExt     := ext
+    sStart   := bar_index
+    sValid   := false
+    sChoch   := bearChoch
+    sMss     := bearMss
+    sKz      := inKZ
+    sLiq     := not na(pdh) and oHigh > pdh ? "PDH" : not na(aH) and oHigh > aH ? "Asie" : ""
+    sEvalNow := true
+else if sState == 1
+    if sValid and high >= sEntry
+        sState := 2
+        sFill  := bar_index
+        if alertOn
+            alert("ENTRÉE " + f_msg("VENTE", sEntry, sEL, sSL, sTP, sRR, sConf), alert.freq_once_per_bar_close)
+    else if low < sExt
+        sExt     := low
+        sEvalNow := true
+    else if bar_index - sStart > maxWait or high > sO or bullBreak
+        f_clear(sLines, sBoxes, sLabs)
+        label.delete(sTag)
+        sState := 0
+
+if sEvalNow
+    [eCnt, eConf, eEntry, eEL, eSL, eTP, eRR, eObT, eObB, eFvT, eFvB, eKey] = f_bearEval(sOIdx, sO, sExt, atr, sChoch, sMss)
+    wasValid = sValid
+    sEntry := eEntry
+    sEL    := eEL
+    sSL    := eSL
+    sTP    := eTP
+    sRR    := eRR
+    sConf  := eConf
+    z618s  = f_fib(sO, sExt, 0.618)
+    pdOk   = usePD and not na(pdMid) and eEntry > pdMid
+    kzOk   = useKZ and sKz
+    lqOk   = useLiq and sLiq != ""
+    hzOk   = useHZ and hzOn and ((not na(hsfT) and hsfT >= z618s and hsfB <= sO) or (not na(hsoT) and hsoT >= z618s and hsoB <= sO))
+    xParts = array.new<string>()
+    if pdOk
+        array.push(xParts, "Premium")
+    if kzOk
+        array.push(xParts, "KZ")
+    if lqOk
+        array.push(xParts, sLiq)
+    if hzOk
+        array.push(xParts, "ZoneHTF")
+    int xCnt = array.size(xParts)
+    xCnt  -= lqOk and str.contains(eConf, "Sweep") ? 1 : 0
+    sConf  := array.size(xParts) > 0 ? eConf + (eCnt > 0 ? "+" : " | ") + array.join(xParts, "+") : eConf
+    sValid := eCnt + xCnt >= minConf and eRR >= minRR and (eKey or lqOk or hzOk or not needKey)
+    f_clear(sLines, sBoxes, sLabs)
+    label.delete(sTag)
+    if sValid
+        f_draw(sLines, sBoxes, sLabs, sOIdx, sO, sExt, sEL, sSL, eObT, eObB, eFvT, eFvB, bearColor)
+        if showLabels
+            sTag := label.new(sOIdx, sO, text = "VENTE " + sConf + "\nE " + str.tostring(sEntry, format.mintick) + " (" + str.tostring(sEL) + ") | " + str.tostring(sRR, "#.#") + "R", style = label.style_label_down, color = color.new(bearColor, 20), textcolor = color.white, size = size.small)
+        if alertOn and not wasValid
+            alert("SETUP " + f_msg("VENTE", sEntry, sEL, sSL, sTP, sRR, sConf), alert.freq_once_per_bar_close)
+
+if sState == 2
+    hitSL = high >= sSL
+    hitTP = bar_index > sFill and low <= sTP
+    if hitSL or hitTP
+        cR = costPx / math.max(sSL - sEntry, syminfo.mintick)
+        r  = (hitSL ? -1.0 : sRR) - cR
+        nTr  += 1
+        nWin += r > 0 ? 1 : 0
+        sumR += r
+        gW   += math.max(r, 0)
+        gL   += math.max(-r, 0)
+        eqR  += r
+        pkR  := math.max(pkR, eqR)
+        ddR  := math.max(ddR, pkR - eqR)
+        if showTrades
+            box.new(sFill, sSL, bar_index, sEntry, border_color = color.new(color.red, 60), bgcolor = color.new(color.red, 85))
+            box.new(sFill, sEntry, bar_index, sTP, border_color = color.new(color.green, 60), bgcolor = color.new(color.green, 85))
+            label.new(bar_index, hitSL ? sSL : sTP, text = (r > 0 ? "+" : "") + str.tostring(r, "#.##") + "R", style = hitSL ? label.style_label_down : label.style_label_up, color = hitSL ? color.red : color.green, textcolor = color.white, size = size.small)
+        if alertOn
+            alert((hitSL ? "STOP " : "OBJECTIF ") + "VENTE " + syminfo.ticker + " " + timeframe.period + " | " + str.tostring(r, "#.##") + "R", alert.freq_once_per_bar_close)
+        f_clear(sLines, sBoxes, sLabs)
+        sTag   := na
+        sState := 0
+
+// ───────── Tableau ─────────
+var table tb = table.new(position.top_right, 2, 9, bgcolor = color.new(color.black, 25), border_width = 1)
+if showStats and barstate.islast
+    wr = nTr > 0 ? 100.0 * nWin / nTr : 0.0
+    ex = nTr > 0 ? sumR / nTr : 0.0
+    st = bState == 2 ? "Achat en position" : sState == 2 ? "Vente en position" : bState == 1 and bValid ? "Achat en attente" : sState == 1 and sValid ? "Vente en attente" : "—"
+    table.cell(tb, 0, 0, "SAV-WS", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 0, not isTF ? "UT hors 5m–1D" : bias == "Neutre (aucun trade)" ? "Biais neutre" : timeframe.period, text_color = isTF ? color.white : color.orange, text_size = size.small)
+    table.cell(tb, 0, 1, "Trades", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 1, str.tostring(nTr), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 2, "Réussite", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 2, str.tostring(wr, "#.#") + " %", text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 3, "Total", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 3, str.tostring(sumR, "#.##") + " R", text_color = sumR >= 0 ? color.green : color.red, text_size = size.small)
+    table.cell(tb, 0, 4, "Espérance", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 4, str.tostring(ex, "#.##") + " R", text_color = ex >= 0 ? color.green : color.red, text_size = size.small)
+    pf = gL > 0 ? gW / gL : na
+    table.cell(tb, 0, 5, "Profit factor", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 5, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = na(pf) or pf >= 1 ? color.green : color.red, text_size = size.small)
+    table.cell(tb, 0, 6, "Drawdown max", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 6, str.tostring(ddR, "#.##") + " R", text_color = color.orange, text_size = size.small)
+    table.cell(tb, 0, 7, "État", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 7, st, text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 8, "Fiabilité", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 8, nTr < 30 ? "< 30 trades : non concluant" : costPx == 0 ? "Coûts non saisis" : "Échantillon suffisant", text_color = nTr < 30 or costPx == 0 ? color.orange : color.green, text_size = size.small)
+
+plot(useAlign ? ema20 : na, "EMA 20", color = color.new(color.aqua, 40))
+plot(useAlign ? ema50 : na, "EMA 50", color = color.new(color.orange, 40))
+plot(useAlign ? ma : na, "SMA lente", color = color.new(color.gray, 20), linewidth = 2)
