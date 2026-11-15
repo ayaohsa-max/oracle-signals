@@ -5,7 +5,8 @@
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
 //|  Version 1.12 – comptes démo et réel                             |
 //|  1.12 : alertes SAV-WS d'observation coupées par défaut (les    |
-//|         résultats restent dans le journal GitHub).              |
+//|         résultats restent dans le journal GitHub) ; 5 idées max  |
+//|         par défaut (au lieu de 3).                               |
 //|  1.11 : SAV-WS : mesure du passage au prix d'entrée (variante    |
 //|         « BE » notée pour chaque résultat) et option de le faire |
 //|         en réel ; consignes lues sans le cache de 5 min de GitHub|
@@ -48,7 +49,7 @@ input double InpMaxRiskPct      = 1.0;                  // Plafond absolu du ris
 input double InpMaxDailyLossPct = 4.0;                  // Perte max du jour en % (coupe tout jusqu'au lendemain)
 input double InpMaxTotalLossPct = 8.0;                  // Perte max totale en % (arrêt définitif)
 input bool   InpTrailingMaxLoss = true;                 // Perte max totale mesurée depuis le plus haut de l'équité (règle FTMO « trailing »)
-input int    InpMaxTrades       = 3;                    // Nombre max d'idées ouvertes ou en attente
+input int    InpMaxTrades       = 5;                    // Nombre max d'idées ouvertes ou en attente
 input double InpMaxSignalAgeH   = 36;                   // Consignes plus vieilles = on annule les ordres en attente
 input bool   InpAlertStale      = true;                 // Alerte Telegram si consignes trop anciennes / illisibles (en semaine)
 input bool   InpAutoAdjust      = true;                 // Recaler les niveaux spot sur le prix du courtier
