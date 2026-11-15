@@ -43,7 +43,8 @@ for c in comments(2):
         continue
     key = (f[1], f[3])
     beats[key] = dict(login=f[1], type=f[2], server=f[3], version=f[4], last=f[5], state=f[6],
-                      consignes=f[7], ideas=f[8], equity=f[9], ccy=f[10], created=c["created_at"])
+                      consignes=f[7], ideas=f[8], equity=f[9], ccy=f[10], created=c["created_at"],
+                      positions=(f[11] if len(f) > 11 else ""), pending=(f[12] if len(f) > 12 else ""))
 accounts = []
 by_login = collections.defaultdict(list)
 for b in beats.values():

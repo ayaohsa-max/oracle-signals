@@ -3,7 +3,12 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.12 – comptes démo et réel                             |
+//|  Version 1.13 – comptes démo et réel                             |
+//|  1.13 : journal des exécutions (ORACLE_OPEN) et positions dans  |
+//|         le signal de vie ; alerte si consignes > 10 h en semaine |
+//|         (sans pause) ; perte max du jour 2,5 % par défaut ; plus |
+//|         de ligne de journal en double ; mode testeur de stratégie|
+//|         MT5 (SAV-WS / SAV-AFS, export oracle_backtest.csv).      |
 //|  1.12 : alertes SAV-WS d'observation coupées par défaut (les    |
 //|         résultats restent dans le journal GitHub) ; 5 idées max  |
 //|         par défaut (au lieu de 3).                               |
@@ -34,7 +39,7 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.12"
+#property version   "1.13"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -46,12 +51,18 @@ input int    InpPollSeconds     = 60;                   // Lecture des consignes
 input bool   InpDemoOnly        = false;                // true = refuser de trader sur un compte réel
 input double InpRiskOverride    = 0.0;                  // Risque % par trade (0 = valeur ORACLE du fichier)
 input double InpMaxRiskPct      = 1.0;                  // Plafond absolu du risque % par trade
-input double InpMaxDailyLossPct = 4.0;                  // Perte max du jour en % (coupe tout jusqu'au lendemain)
+input double InpMaxDailyLossPct = 2.5;                  // Perte max du jour en % (coupe tout jusqu'au lendemain)
 input double InpMaxTotalLossPct = 8.0;                  // Perte max totale en % (arrêt définitif)
 input bool   InpTrailingMaxLoss = true;                 // Perte max totale mesurée depuis le plus haut de l'équité (règle FTMO « trailing »)
 input int    InpMaxTrades       = 5;                    // Nombre max d'idées ouvertes ou en attente
 input double InpMaxSignalAgeH   = 36;                   // Consignes plus vieilles = on annule les ordres en attente
 input bool   InpAlertStale      = true;                 // Alerte Telegram si consignes trop anciennes / illisibles (en semaine)
+input double InpStaleWarnH      = 10;                   // Alerte (sans pause) si consignes plus vieilles que N heures en semaine : tâches ORACLE arrêtées ?
+input string InpTestNote        = "--- Testeur de stratégie MT5 uniquement ---";
+input int    InpTestBias        = 2;                    // Testeur : biais simulé (1 = achats, -1 = ventes, 2 = les deux)
+input double InpTestRisk        = 0.5;                  // Testeur : risque % par trade
+input int    InpTestSwMode      = 1;                    // Testeur : SAV-WS (0 = arrêt, 1 = observation, 2 = trading)
+input int    InpTestSavMode     = 1;                    // Testeur : SAV-AFS (0 = arrêt, 1 = observation, 2 = trading)
 input bool   InpAutoAdjust      = true;                 // Recaler les niveaux spot sur le prix du courtier
 input double InpMaxAdjustPct    = 1.0;                  // Écart spot/courtier max accepté (%)
 input bool   InpBreakEven       = true;                 // Stop à l'entrée sur la 2e moitié une fois TP1 touché
@@ -138,6 +149,9 @@ string   g_state     = "démarrage"; // état affiché, repris dans le signal de
 datetime g_lastBeat  = 0;    // dernier signal de vie envoyé (heure locale)
 datetime g_lastOk    = 0;    // dernière lecture réussie des consignes (GMT)
 bool     g_staleSent = false; // alerte « consignes » déjà envoyée
+bool     g_warnSent  = false; // alerte « consignes de plus de N h » déjà envoyée
+bool     g_tester    = false; // testeur de stratégie MT5
+string   g_sentLines[];       // dernières lignes de journal mises en file (anti-doublon)
 string   g_symCache[];       // symboles dont l'ATR est suivi
 int      g_atrHandle[];
 int      g_savMode  = 1;     // SAV-AFS : 0 = arrêt, 1 = observation, 2 = trading (valeur ORACLE)
@@ -175,6 +189,7 @@ void QueueDropFirst(string &q[])
 void Notify(string msg)
   {
    Print("ORACLE : ", msg);
+   if(g_tester) return;
    if(InpPush)
       SendNotification("ORACLE : " + msg);
    if(InpTgToken != "")
@@ -237,8 +252,22 @@ bool GitSend(string line, int issue = 0)
    return code == 201 || code == 401 || code == 403 || code == 404 || code == 422;
   }
 
+// File d'envoi GitHub sans doublon : une même ligne n'est mise en file qu'une fois
+void GitQueue(string line)
+  {
+   if(InpGitToken == "" || g_tester) return;
+   for(int i = 0; i < ArraySize(g_sentLines); i++)
+      if(g_sentLines[i] == line) return;
+   int n = ArraySize(g_sentLines);
+   if(n >= 200) { for(int i = 1; i < n; i++) g_sentLines[i - 1] = g_sentLines[i]; n--; ArrayResize(g_sentLines, n); }
+   ArrayResize(g_sentLines, n + 1);
+   g_sentLines[n] = line;
+   QueuePush(g_gitQueue, line);
+  }
+
 void FlushQueues()
   {
+   if(g_tester) return;
    int sent = 0;
    while(ArraySize(g_tgQueue) > 0 && sent < 10)
      {
@@ -257,7 +286,8 @@ void FlushQueues()
 
 void JournalLocal(string line)
   {
-   int h = FileOpen("oracle_journal.csv", FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ);
+   int h = g_tester ? FileOpen("oracle_backtest.csv", FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ | FILE_COMMON)
+                    : FileOpen("oracle_journal.csv", FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ);
    if(h == INVALID_HANDLE) return;
    FileSeek(h, 0, SEEK_END);
    FileWriteString(h, line + "\r\n");
@@ -349,6 +379,7 @@ string FindSymbol(string &keys[])
 
 string ResolveSymbol(string asset)
   {
+   if(g_tester && asset == "TEST") return _Symbol;
    string ov = "";
    if(asset == "GOLD")  ov = InpSymGold;
    if(asset == "BRENT") ov = InpSymBrent;
@@ -653,7 +684,7 @@ bool GuardsBlock()
                                   AccountInfoInteger(ACCOUNT_LOGIN), GlobalVariableGet(GV("day")), bal, eq, pk,
                                   bal - prevBal, AccountInfoString(ACCOUNT_CURRENCY));
          JournalLocal(ln);
-         if(InpGitToken != "") QueuePush(g_gitQueue, ln);
+         GitQueue(ln);
         }
       GlobalVariableSet(GV("day"), day);
       GlobalVariableSet(GV("day_bal"), bal);
@@ -1239,7 +1270,7 @@ void LoadVirtual()
 void SavJournal(string line)
   {
    JournalLocal(line);
-   if(InpGitToken != "") QueuePush(g_gitQueue, line);
+   GitQueue(line);
   }
 
 // Suivi des trades virtuels : stop ou objectif touché sur les bougies suivantes (stop prioritaire si les deux)
@@ -1366,7 +1397,7 @@ void SavProcess(bool allowed)
          if(!SavScan(sym, tf, L, aligned, h)) continue;   // historique pas encore chargé : on réessaiera
          GlobalVariableSet(key, (double)barT);
          if(!h.found) continue;
-         if(h.buy != (bias > 0)) continue;          // seulement dans le sens du biais fondamental
+         if(bias != 2 && h.buy != (bias > 0)) continue;          // seulement dans le sens du biais fondamental
          if(TimeCurrent() - (h.t + PeriodSeconds(tf)) > 15 * 60) continue;   // signal trop ancien (robot redémarré)
          int d = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
          string taken = "OBS";
@@ -1851,7 +1882,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
       bool alBull = !InpSwAlign || (maOk && e20[t] > e50[t] && e50[t] > s200[t]);
       bool alBear = !InpSwAlign || (maOk && e20[t] < e50[t] && e50[t] < s200[t]);
       bool canBull = bullBreak && (InpSwChoch || !bullChoch) && bias > 0 && htfBull && alBull;
-      bool canBear = bearBreak && (InpSwChoch || !bearChoch) && bias < 0 && htfBear && alBear;
+      bool canBear = bearBreak && (InpSwChoch || !bearChoch) && (bias < 0 || bias == 2) && htfBear && alBear;
       bool bullMss = bullBreak && (r[t].close - r[t].open) >= InpSwMssAtr * atr[t];
       bool bearMss = bearBreak && (r[t].open - r[t].close) >= InpSwMssAtr * atr[t];
       int brkHighIdx = lastHighIdx, brkLowIdx = lastLowIdx;
@@ -2351,7 +2382,16 @@ void StaleAlert(bool ok, bool stale, int wk)
                   " UTC). Robot en pause, ordres en attente annulés. Vérifier les tâches ORACLE."
                 : "ALERTE : consignes illisibles depuis plus d'1 h (réseau, GitHub ou WebRequest). Robot en pause.");
      }
-   else if(!bad && !stale && g_staleSent)
+   double ageH = (g_updated > 0) ? (double)(TimeGMT() - g_updated) / 3600.0 : 0;
+   if(ok && !stale && office && InpStaleWarnH > 0 && ageH > InpStaleWarnH && !g_warnSent)
+     {
+      g_warnSent = true;
+      Notify(StringFormat("ALERTE : consignes de plus de %.0f h (publiées le %s UTC). Les tâches ORACLE semblent arrêtées (quota Claude ?). Le robot continue avec les ordres actuels et se mettra en pause à %.0f h.",
+                          InpStaleWarnH, TimeToString(g_updated, TIME_DATE | TIME_MINUTES), InpMaxSignalAgeH));
+     }
+   else if(ok && ageH <= InpStaleWarnH && g_warnSent)
+      g_warnSent = false;
+   if(!bad && !stale && g_staleSent)
      {
       g_staleSent = false;
       Notify("consignes de nouveau à jour (" + TimeToString(g_updated, TIME_DATE | TIME_MINUTES) + " UTC), robot réactivé.");
@@ -2359,19 +2399,38 @@ void StaleAlert(bool ok, bool stale, int wk)
   }
 
 // Signal de vie : un commentaire dans le ticket GitHub InpBeatIssue toutes les InpBeatMinutes minutes.
-// HEARTBEAT;compte;DÉMO|RÉEL;serveur;version;heure UTC;état;consignes du;idées;équité;devise
+// HEARTBEAT;compte;DÉMO|RÉEL;serveur;version;heure UTC;état;consignes du;idées;équité;devise;positions (ID:symbole:sens:résultat, ou -);ordres en attente
 void Heartbeat()
   {
+   if(g_tester) return;
    if(InpGitToken == "" || InpBeatIssue <= 0) return;
    if(g_lastBeat != 0 && TimeLocal() - g_lastBeat < MathMax(15, InpBeatMinutes) * 60) return;
    g_lastBeat = TimeLocal();
-   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.12;%s;%s;%s;%d;%.2f;%s",
+   string pos = "";
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if(PositionGetTicket(i) == 0) continue;
+      long mg = PositionGetInteger(POSITION_MAGIC);
+      if(!IsOurs(mg)) continue;
+      if(pos != "") pos += ",";
+      pos += StringFormat("%s:%s:%s:%.2f", NumToId(MagicId(mg)), PositionGetString(POSITION_SYMBOL),
+                          PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                          PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP));
+     }
+   if(pos == "") pos = "-";
+   int pend = 0;
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong tk = OrderGetTicket(i);
+      if(tk != 0 && IsOurs(OrderGetInteger(ORDER_MAGIC))) pend++;
+     }
+   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.13;%s;%s;%s;%d;%.2f;%s;%s;%d",
                               AccountInfoInteger(ACCOUNT_LOGIN),
                               AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                               AccountInfoString(ACCOUNT_SERVER),
                               TimeToString(TimeGMT(), TIME_DATE | TIME_MINUTES), g_state,
                               g_updated > 0 ? TimeToString(g_updated, TIME_DATE | TIME_MINUTES) : "jamais",
-                              CountActiveIds(), AccountInfoDouble(ACCOUNT_EQUITY), AccountInfoString(ACCOUNT_CURRENCY));
+                              CountActiveIds(), AccountInfoDouble(ACCOUNT_EQUITY), AccountInfoString(ACCOUNT_CURRENCY), pos, pend);
    if(!GitSend(line, InpBeatIssue)) g_lastBeat = TimeLocal() - MathMax(15, InpBeatMinutes) * 60 + 300;   // échec : réessai dans 5 min
   }
 
@@ -2382,7 +2441,7 @@ void Cycle()
    GlobalVariableSet(AliveName(), (double)TimeGMT());
    static datetime lastFlush = 0;
    if(TimeLocal() - lastFlush >= 600) { GlobalVariablesFlush(); lastFlush = TimeLocal(); }   // survit à une coupure de courant
-   if(InpDemoOnly && TerminalInfoInteger(TERMINAL_CONNECTED) && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
+   if(InpDemoOnly && !g_tester && TerminalInfoInteger(TERMINAL_CONNECTED) && AccountInfoInteger(ACCOUNT_TRADE_MODE) != ACCOUNT_TRADE_MODE_DEMO)
      {
       Comment("ORACLE : compte RÉEL détecté, robot à l'arrêt (réglage « Démo uniquement »).");
       g_state = "arrêt : compte réel refusé (Démo uniquement)";
@@ -2412,7 +2471,8 @@ void Cycle()
      }
 
    string txt;
-   bool ok = FetchText(txt) && Parse(txt);
+   bool ok = g_tester ? true : (FetchText(txt) && Parse(txt));
+   if(g_tester) g_updated = TimeGMT();
    if(ok) g_lastOk = TimeGMT();
    bool stale = !ok || (TimeGMT() - g_updated > (long)(InpMaxSignalAgeH * 3600));
    bool black = InBlackout();
@@ -2444,7 +2504,7 @@ void Cycle()
    int nbias = 0;
    for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
 
-   Comment(StringFormat("ORACLE Executor v1.12 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
+   Comment(StringFormat("ORACLE Executor v1.13 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
@@ -2457,6 +2517,19 @@ void Cycle()
 
 int OnInit()
   {
+   g_tester = (bool)MQLInfoInteger(MQL_TESTER);
+   if(g_tester)
+     {
+      // Testeur de stratégie : pas de GitHub ni de Telegram ; biais, risque et modes viennent des réglages « Testeur ».
+      ArrayResize(g_biasAsset, 1); ArrayResize(g_biasVal, 1);
+      g_biasAsset[0] = "TEST"; g_biasVal[0] = InpTestBias;
+      g_risk = InpTestRisk; g_enabled = true; g_updated = TimeGMT();
+      g_swMode = InpTestSwMode; g_savMode = InpTestSavMode; g_nsig = 0;
+      FileDelete("oracle_backtest.csv", FILE_COMMON);
+      g_trade.SetDeviationInPoints(30);
+      EventSetTimer(MathMax(10, InpPollSeconds));
+      return INIT_SUCCEEDED;
+     }
    // Un seul robot ORACLE par MetaTrader : refuse de démarrer si un autre graphique l'exécute déjà.
    if(GlobalVariableCheck(LockName()) && GlobalVariableGet(LockName()) != ChartKey() &&
       GlobalVariableCheck(BeatName()) && TimeLocal() - (datetime)GlobalVariableGet(BeatName()) < 3 * MathMax(10, InpPollSeconds))
@@ -2556,7 +2629,7 @@ void JournalTrade(ulong outDeal)
                               TimeToString(tOut, TIME_DATE | TIME_MINUTES), DoubleToString(exitPx, dg), why,
                               vol, pnl, AccountInfoString(ACCOUNT_CURRENCY), rMult, mfeR, maeR);
    JournalLocal(line);
-   if(InpGitToken != "") QueuePush(g_gitQueue, line);
+   GitQueue(line);
   }
 
 //+------------------------------------------------------------------+
@@ -2577,6 +2650,17 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    if(entry == DEAL_ENTRY_IN)
      {
       GlobalVariableSet(GV("filled_" + IntegerToString(idnum)), 1);
+      double psl = 0, ptp = 0;
+      long posId = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      if(PositionSelectByTicket((ulong)posId)) { psl = PositionGetDouble(POSITION_SL); ptp = PositionGetDouble(POSITION_TP); }
+      string ol = StringFormat("ORACLE_OPEN;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%.2f",
+                               AccountInfoInteger(ACCOUNT_LOGIN), id, MagicLeg(m) == 1 ? "A" : "B", sym,
+                               HistoryDealGetInteger(trans.deal, DEAL_TYPE) == DEAL_TYPE_BUY ? "BUY" : "SELL",
+                               TimeToString((datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME), TIME_DATE | TIME_MINUTES),
+                               DoubleToString(price, d), DoubleToString(psl, d), DoubleToString(ptp, d),
+                               HistoryDealGetDouble(trans.deal, DEAL_VOLUME));
+      JournalLocal(ol);
+      GitQueue(ol);
       Notify(StringFormat("%s %s exécuté à %s (moitié %s)", id, sym, DoubleToString(price, d), MagicLeg(m) == 1 ? "A" : "B"));
      }
    else if(entry == DEAL_ENTRY_OUT)
