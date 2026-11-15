@@ -87,14 +87,32 @@ for a in accounts:
 
 # --- journal
 sig, res, days = [], [], []
+ws_setups, ws_res, ws_real = [], [], []
+seen_bodies = set()
 for c in comments(1):
+    if c["body"] in seen_bodies:
+        continue                       # ligne en double dans le journal
+    seen_bodies.add(c["body"])
     f = c["body"].split(";")
+    if f[0] == "SAVWS_SETUP" and len(f) >= 14:
+        ws_setups.append(dict(code=f[2], tf=f[4], side="Achat" if f[5] == "BUY" else "Vente", time=f[6],
+                              entry=f[7], sl=f[8], tp=f[9], rr=f[10], conf=f[12], mode=f[13]))
+    elif f[0] == "SAVWS_RESULT" and len(f) >= 9:
+        try:
+            ws_res.append(dict(code=f[2], tf=f[4], why=f[7], r=float(f[8])))
+        except ValueError:
+            pass
+    elif f[0] == "ORACLE_TRADE" and len(f) >= 16 and f[2].startswith("W"):
+        try:
+            ws_real.append(float(f[15]))
+        except ValueError:
+            pass
     if f[0] == "SAV_SIGNAL" and len(f) >= 11:
         sig.append(dict(time=f[6], code=f[2], tf=f[4], side="Achat" if f[5] == "BUY" else "Vente",
                         entry=f[7], sl=f[8], tp=f[9], taken={"OBS": "observé", "PRIS": "pris", "NON_PRIS": "non pris"}.get(f[10], f[10])))
     elif f[0] == "SAV_RESULT" and len(f) >= 10:
         try:
-            res.append(float(f[9]))
+            res.append(float(f[8]))
         except ValueError:
             pass
     elif f[0] == "ORACLE_DAY" and len(f) >= 8:
@@ -109,7 +127,16 @@ if len(sys.argv) > 1:
         biases = json.load(open(sys.argv[1], encoding="utf-8"))
     except Exception:
         pass
-out = dict(accounts=accounts, alerts=alerts, biases=biases,
+def _stats(rs):
+    n = len(rs)
+    if not n:
+        return dict(n=0, exp=None, win=None, pf=None)
+    gain = sum(r for r in rs if r > 0); loss = -sum(r for r in rs if r <= 0)
+    return dict(n=n, exp=round(sum(rs) / n, 2), win=f"{100*sum(1 for r in rs if r > 0)/n:.0f} %",
+                pf=(round(gain / loss, 2) if loss > 0 else None))
+savws = dict(setups=len(ws_setups), sim=_stats([x["r"] for x in ws_res]), real=_stats(ws_real),
+             recent=list(reversed(ws_setups))[:10], target=30)
+out = dict(accounts=accounts, alerts=alerts, biases=biases, savws=savws,
            sav=dict(mode=None, signals=list(reversed(sig))[:15], results=results),
            days=list(reversed(days))[:10])
 print(json.dumps(out, ensure_ascii=False))
