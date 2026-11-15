@@ -3,7 +3,9 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.11 – comptes démo et réel                             |
+//|  Version 1.12 – comptes démo et réel                             |
+//|  1.12 : alertes SAV-WS d'observation coupées par défaut (les    |
+//|         résultats restent dans le journal GitHub).              |
 //|  1.11 : SAV-WS : mesure du passage au prix d'entrée (variante    |
 //|         « BE » notée pour chaque résultat) et option de le faire |
 //|         en réel ; consignes lues sans le cache de 5 min de GitHub|
@@ -31,7 +33,7 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.11"
+#property version   "1.12"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -83,7 +85,7 @@ input int    InpSwMode          = -1;                   // SAV-WS : -1 = selon O
 input ENUM_TIMEFRAMES InpSwTF1  = PERIOD_M15;           // SAV-WS : unité 1 (Actuelle = désactivée)
 input ENUM_TIMEFRAMES InpSwTF2  = PERIOD_H1;            // SAV-WS : unité 2 (Actuelle = désactivée)
 input ENUM_TIMEFRAMES InpSwHTF  = PERIOD_H4;            // SAV-WS : unité supérieure (tendance, Premium/Discount, zones)
-input bool   InpSwNotify        = true;                 // SAV-WS : Telegram / mobile pour chaque setup en observation
+input bool   InpSwNotify        = false;                // SAV-WS : Telegram / mobile pour chaque setup en observation
 input int    InpSwPivot         = 5;                    // SAV-WS : longueur des pivots
 input bool   InpSwChoch         = true;                 // SAV-WS : setups aussi sur CHoCH
 input bool   InpSwHtfTrend      = true;                 // SAV-WS : prix du bon côté de la SMA 200 de l'unité supérieure
@@ -2362,7 +2364,7 @@ void Heartbeat()
    if(InpGitToken == "" || InpBeatIssue <= 0) return;
    if(g_lastBeat != 0 && TimeLocal() - g_lastBeat < MathMax(15, InpBeatMinutes) * 60) return;
    g_lastBeat = TimeLocal();
-   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.11;%s;%s;%s;%d;%.2f;%s",
+   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.12;%s;%s;%s;%d;%.2f;%s",
                               AccountInfoInteger(ACCOUNT_LOGIN),
                               AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                               AccountInfoString(ACCOUNT_SERVER),
@@ -2441,7 +2443,7 @@ void Cycle()
    int nbias = 0;
    for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
 
-   Comment(StringFormat("ORACLE Executor v1.11 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
+   Comment(StringFormat("ORACLE Executor v1.12 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
