@@ -3,7 +3,11 @@
 //|  Robot d'exécution des idées ORACLE pour MetaTrader 5 (OANDA)    |
 //|  Lit un fichier de consignes, pose des ordres en attente avec    |
 //|  stop et objectifs, gère le break-even et les garde-fous.        |
-//|  Version 1.13 – comptes démo et réel                             |
+//|  Version 1.14 – comptes démo et réel                             |
+//|  1.14 : plafond d'exposition par devise (2 trades max dans le   |
+//|         même sens), 3 trades SAV-WS max par jour, pause         |
+//|         automatique autour des annonces à fort impact (calendrier|
+//|         économique MT5), alerte « nouvelle version disponible ».  |
 //|  1.13 : journal des exécutions (ORACLE_OPEN) et positions dans  |
 //|         le signal de vie ; alerte si consignes > 10 h en semaine |
 //|         (sans pause) ; perte max du jour 2,5 % par défaut ; plus |
@@ -39,7 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.13"
+#property version   "1.14"
+#define ORACLE_VERSION "1.14"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -57,6 +62,12 @@ input bool   InpTrailingMaxLoss = true;                 // Perte max totale mesu
 input int    InpMaxTrades       = 5;                    // Nombre max d'idées ouvertes ou en attente
 input double InpMaxSignalAgeH   = 36;                   // Consignes plus vieilles = on annule les ordres en attente
 input bool   InpAlertStale      = true;                 // Alerte Telegram si consignes trop anciennes / illisibles (en semaine)
+input int    InpMaxPerCcySide   = 2;                    // Exposition : trades max dans le même sens sur une même devise (0 = sans limite)
+input int    InpSwMaxPerDay     = 3;                    // SAV-WS : trades réels max par jour
+input bool   InpUseCalendar     = true;                 // Pause automatique autour des annonces à fort impact (calendrier économique MT5)
+input int    InpCalMinutes      = 15;                   // Minutes de pause avant et après une annonce à fort impact
+input string InpCalCurrencies   = "USD,EUR,GBP,JPY,AUD,NZD,CAD,CHF"; // Devises dont les annonces à fort impact mettent le robot en pause
+input string InpVersionURL      = "https://raw.githubusercontent.com/ayaohsa-max/oracle-signals/main/VERSION"; // Version publiée (alerte de mise à jour)
 input double InpStaleWarnH      = 10;                   // Alerte (sans pause) si consignes plus vieilles que N heures en semaine : tâches ORACLE arrêtées ?
 input string InpTestNote        = "--- Testeur de stratégie MT5 uniquement ---";
 input int    InpTestBias        = 2;                    // Testeur : biais simulé (1 = achats, -1 = ventes, 2 = les deux)
@@ -849,6 +860,123 @@ int LossStreakNow()
 //+------------------------------------------------------------------+
 //| Pose d'une idée                                                  |
 //+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| v1.14 : exposition par devise, limite SAV-WS du jour, calendrier,|
+//| alerte de nouvelle version                                       |
+//+------------------------------------------------------------------+
+// Refuse un nouveau trade si InpMaxPerCcySide trades (positions ou ordres, une idée comptée une fois)
+// sont déjà dans le même sens sur la devise de base ou de cotation (ex. 2 ventes de dollar déjà en cours).
+bool CcyExposureOK(string sym, bool buy, int selfId)
+  {
+   if(InpMaxPerCcySide <= 0) return true;
+   string b = SymbolInfoString(sym, SYMBOL_CURRENCY_BASE), q = SymbolInfoString(sym, SYMBOL_CURRENCY_PROFIT);
+   if(b == "" || q == "" || b == q) return true;
+   string myL = buy ? b : q, myS = buy ? q : b;
+   int nL = 0, nS = 0;
+   int seen[];
+   ArrayResize(seen, 0);
+   for(int pass = 0; pass < 2; pass++)
+     {
+      int tot = (pass == 0) ? PositionsTotal() : OrdersTotal();
+      for(int i = tot - 1; i >= 0; i--)
+        {
+         long mg = 0;
+         string s2 = "";
+         bool b2 = true;
+         if(pass == 0)
+           {
+            if(PositionGetTicket(i) == 0) continue;
+            mg = PositionGetInteger(POSITION_MAGIC);
+            s2 = PositionGetString(POSITION_SYMBOL);
+            b2 = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+           }
+         else
+           {
+            ulong tk = OrderGetTicket(i);
+            if(tk == 0) continue;
+            mg = OrderGetInteger(ORDER_MAGIC);
+            s2 = OrderGetString(ORDER_SYMBOL);
+            long ty = OrderGetInteger(ORDER_TYPE);
+            b2 = (ty == ORDER_TYPE_BUY_LIMIT || ty == ORDER_TYPE_BUY_STOP || ty == ORDER_TYPE_BUY);
+           }
+         if(!IsOurs(mg)) continue;
+         int id = MagicId(mg);
+         if(id == selfId) continue;
+         bool dup = false;
+         for(int k = 0; k < ArraySize(seen); k++) if(seen[k] == id) dup = true;
+         if(dup) continue;
+         int ns = ArraySize(seen);
+         ArrayResize(seen, ns + 1);
+         seen[ns] = id;
+         string b3 = SymbolInfoString(s2, SYMBOL_CURRENCY_BASE), q3 = SymbolInfoString(s2, SYMBOL_CURRENCY_PROFIT);
+         if(b3 == "" || q3 == "" || b3 == q3) continue;
+         string lng = b2 ? b3 : q3, sht = b2 ? q3 : b3;
+         if(lng == myL) nL++;
+         if(sht == myS) nS++;
+        }
+     }
+   if(nL >= InpMaxPerCcySide || nS >= InpMaxPerCcySide)
+     {
+      Print("ORACLE : ", sym, " non pris : déjà ", MathMax(nL, nS), " trade(s) dans le même sens sur ", (nL >= InpMaxPerCcySide ? myL : myS), " (plafond d'exposition par devise).");
+      return false;
+     }
+   return true;
+  }
+
+string SwDayKey()
+  {
+   MqlDateTime t;
+   TimeToStruct(TimeCurrent(), t);
+   return GV(StringFormat("swday_%04d%02d%02d", t.year, t.mon, t.day));
+  }
+int SwDayCount() { string k = SwDayKey(); return GlobalVariableCheck(k) ? (int)GlobalVariableGet(k) : 0; }
+
+// Annonce à fort impact dans la fenêtre de ± InpCalMinutes (calendrier économique intégré à MT5)
+bool CalBlackout()
+  {
+   if(!InpUseCalendar || g_tester) return false;
+   static datetime lastChk = 0;
+   static bool lastRes = false;
+   if(lastChk != 0 && TimeLocal() - lastChk < 60) return lastRes;
+   lastChk = TimeLocal();
+   lastRes = false;
+   MqlCalendarValue v[];
+   datetime now = TimeTradeServer();
+   if(CalendarValueHistory(v, now - InpCalMinutes * 60, now + InpCalMinutes * 60) <= 0) return false;
+   for(int i = 0; i < ArraySize(v); i++)
+     {
+      MqlCalendarEvent ev;
+      if(!CalendarEventById(v[i].event_id, ev)) continue;
+      if(ev.importance != CALENDAR_IMPORTANCE_HIGH) continue;
+      MqlCalendarCountry c;
+      if(!CalendarCountryById(ev.country_id, c)) continue;
+      if(StringFind(InpCalCurrencies, c.currency) < 0) continue;
+      lastRes = true;
+      break;
+     }
+   return lastRes;
+  }
+
+// Une fois par jour : compare la version installée à celle publiée sur GitHub
+void VersionCheck()
+  {
+   if(g_tester || InpVersionURL == "") return;
+   static datetime last = 0;
+   if(last != 0 && TimeLocal() - last < 86400) return;
+   last = TimeLocal();
+   char data[], res[];
+   string rh;
+   ResetLastError();
+   int code = WebRequest("GET", InpVersionURL, "User-Agent: ORACLE-EA\r\n", 8000, data, res, rh);
+   if(code != 200) return;
+   string v = CharArrayToString(res, 0, WHOLE_ARRAY, CP_UTF8);
+   StringTrimLeft(v);
+   StringTrimRight(v);
+   if(v != "" && v != ORACLE_VERSION && StringToDouble(v) > StringToDouble(ORACLE_VERSION))
+      Notify("nouvelle version du robot disponible sur GitHub : v" + v + " (installée : v" + ORACLE_VERSION + "). Recopier ORACLE_Executor.mq5 dans MetaEditor puis F7.");
+  }
+
 void PlaceSignal(OSignal &s)
   {
    int idnum = IdToNum(s.id);
@@ -865,6 +993,7 @@ void PlaceSignal(OSignal &s)
    double e, sl, t1, t2;
    Levels(s, sym, e, sl, t1, t2);
    ENUM_ORDER_TYPE ot = OrderTypeOf(s);
+   if(!CcyExposureOK(sym, (ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP), idnum)) return;
 
    // l'ordre doit être du bon côté du marché, sinon il partirait au marché
    double gap = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(sym, SYMBOL_POINT);
@@ -1320,6 +1449,7 @@ bool PlaceSavMarket(string asset, string sym, int tfh, SavHit &h)
    if(SymbolInfoInteger(sym, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL) return false;
    double bid = SymbolInfoDouble(sym, SYMBOL_BID), ask = SymbolInfoDouble(sym, SYMBOL_ASK);
    if(bid <= 0 || ask <= 0) return false;
+   if(!CcyExposureOK(sym, h.buy, -1)) return false;
    double px = h.buy ? ask : bid;
    double sl = RoundPrice(sym, h.sl);
    double gap = SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) * SymbolInfoDouble(sym, SYMBOL_POINT);
@@ -2113,6 +2243,7 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
       if(IsOurs(mg) && MagicId(mg) == idnum) return;     // en position : stop et objectif chez le courtier
      }
    if(!allowed || g_swState[slot] != 1) return;          // l'ordre éventuel sera retiré par le balayage final
+   if(InpSwMaxPerDay > 0 && SwDayCount() >= InpSwMaxPerDay) return;   // limite du jour atteinte : ordre retiré
 
    bool buy = g_swBuy[slot];
    double e  = RoundPrice(sym, g_swE[slot]);
@@ -2131,6 +2262,7 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
       Print("ORACLE : ", NumToId(idnum), " SAV-WS ", sym, " niveaux mis à jour, ordre remplacé.");
      }
    if(CountActiveIds() >= InpMaxTrades) return;
+   if(!CcyExposureOK(sym, buy, idnum)) return;
    if(SwOpposite(sym, buy, idnum)) return;
    if(SymbolInfoInteger(sym, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_FULL) return;
    double bid = SymbolInfoDouble(sym, SYMBOL_BID), ask = SymbolInfoDouble(sym, SYMBOL_ASK);
@@ -2424,7 +2556,7 @@ void Heartbeat()
       ulong tk = OrderGetTicket(i);
       if(tk != 0 && IsOurs(OrderGetInteger(ORDER_MAGIC))) pend++;
      }
-   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;1.13;%s;%s;%s;%d;%.2f;%s;%s;%d",
+   string line = StringFormat("HEARTBEAT;%I64d;%s;%s;" + ORACLE_VERSION + ";%s;%s;%s;%d;%.2f;%s;%s;%d",
                               AccountInfoInteger(ACCOUNT_LOGIN),
                               AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                               AccountInfoString(ACCOUNT_SERVER),
@@ -2475,7 +2607,7 @@ void Cycle()
    if(g_tester) g_updated = TimeGMT();
    if(ok) g_lastOk = TimeGMT();
    bool stale = !ok || (TimeGMT() - g_updated > (long)(InpMaxSignalAgeH * 3600));
-   bool black = InBlackout();
+   bool black = InBlackout() || CalBlackout();
    int wk = WeekendState();
    if(wk == 1) FridayClose();
    else if(wk == 0) WeekendCatchUp();
@@ -2504,7 +2636,7 @@ void Cycle()
    int nbias = 0;
    for(int i = 0; i < ArraySize(g_biasVal); i++) if(g_biasVal[i] != 0) nbias++;
 
-   Comment(StringFormat("ORACLE Executor v1.13 | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
+   Comment(StringFormat("ORACLE Executor v" + ORACLE_VERSION + " | %s | consignes du %s UTC | %d idée(s) | risque %.2f %% | sortie %s | SAV-AFS %s (%d actif(s) orienté(s), %d suivi(s)) | SAV-WS %s (%d setup(s) en attente) | Telegram %s | journal %s | %s",
                         AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO ? "DÉMO" : "RÉEL",
                         TimeToString(g_updated, TIME_DATE | TIME_MINUTES), g_nsig,
                         MathMin(InpRiskOverride > 0 ? InpRiskOverride : g_risk, InpMaxRiskPct),
@@ -2569,6 +2701,7 @@ void OnTimer()
    Cycle();
    FlushQueues();
    Heartbeat();
+   VersionCheck();
   }
 
 //+------------------------------------------------------------------+
@@ -2650,6 +2783,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
    if(entry == DEAL_ENTRY_IN)
      {
       GlobalVariableSet(GV("filled_" + IntegerToString(idnum)), 1);
+      if(SwIsSw(idnum)) GlobalVariableSet(SwDayKey(), SwDayCount() + 1);
       double psl = 0, ptp = 0;
       long posId = HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
       if(PositionSelectByTicket((ulong)posId)) { psl = PositionGetDouble(POSITION_SL); ptp = PositionGetDouble(POSITION_TP); }
