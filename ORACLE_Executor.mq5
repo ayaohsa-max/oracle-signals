@@ -112,6 +112,7 @@ input int    InpSavMaxBars      = 60;                   // SAV-AFS : durée max 
 input int    InpSwMode          = -1;                   // SAV-WS : -1 = selon ORACLE, 0 = arrêt, 1 = observation, 2 = trading
 input ENUM_TIMEFRAMES InpSwTF1  = PERIOD_M15;           // SAV-WS : unité 1 (Actuelle = désactivée)
 input ENUM_TIMEFRAMES InpSwTF2  = PERIOD_H1;            // SAV-WS : unité 2 (Actuelle = désactivée)
+input string InpTestSwTFs       = "M15,H1,H2,H4,D1";    // Testeur : unités SAV-WS testées ensemble (vide = unités 1 et 2)
 input ENUM_TIMEFRAMES InpSwHTF  = PERIOD_H4;            // SAV-WS : unité supérieure (tendance, Premium/Discount, zones)
 input bool   InpSwNotify        = false;                // SAV-WS : Telegram / mobile pour chaque setup en observation
 input int    InpSwPivot         = 5;                    // SAV-WS : longueur des pivots
@@ -168,6 +169,7 @@ bool     g_staleSent = false; // alerte « consignes » déjà envoyée
 bool     g_warnSent  = false; // alerte « consignes de plus de N h » déjà envoyée
 bool     g_tester    = false; // testeur de stratégie MT5
 string   g_btFile    = "oracle_backtest.csv"; // journal du testeur : un fichier par actif (v1.15)
+ENUM_TIMEFRAMES g_swTFs[];   // unités SAV-WS scannées (v1.15 : liste du testeur, sinon unités 1 et 2)
 bool     g_wkCrypto  = false; // v1.15 : week-end en cours avec SAV-WS autorisé sur les cryptos
 string   g_sentLines[];       // dernières lignes de journal mises en file (anti-doublon)
 string   g_symCache[];       // symboles dont l'ATR est suivi
@@ -1747,6 +1749,43 @@ int SwSlot(string key)
    return n;
   }
 
+// Unité supérieure d'une unité SAV-WS (v1.15) : le réglage s'il est plus grand ; sinon D1 (H4 et moins) ; D1 : aucune
+ENUM_TIMEFRAMES SwHTF(ENUM_TIMEFRAMES tf)
+  {
+   if(PeriodSeconds(InpSwHTF) > PeriodSeconds(tf)) return InpSwHTF;
+   if(PeriodSeconds(tf) < PeriodSeconds(PERIOD_D1)) return PERIOD_D1;
+   return tf;
+  }
+
+ENUM_TIMEFRAMES TfFromName(string t)
+  {
+   StringTrimLeft(t); StringTrimRight(t); StringToUpper(t);
+   if(t == "M5") return PERIOD_M5;   if(t == "M15") return PERIOD_M15; if(t == "M30") return PERIOD_M30;
+   if(t == "H1") return PERIOD_H1;   if(t == "H2") return PERIOD_H2;   if(t == "H3") return PERIOD_H3;
+   if(t == "H4") return PERIOD_H4;   if(t == "H6") return PERIOD_H6;   if(t == "H8") return PERIOD_H8;
+   if(t == "H12") return PERIOD_H12; if(t == "D1") return PERIOD_D1;
+   return PERIOD_CURRENT;
+  }
+
+void SwInitTFs()
+  {
+   ArrayResize(g_swTFs, 0);
+   if(g_tester && InpTestSwTFs != "")
+     {
+      string p[];
+      int n = StringSplit(InpTestSwTFs, ',', p);
+      for(int i = 0; i < n; i++)
+        {
+         ENUM_TIMEFRAMES t = TfFromName(p[i]);
+         if(t == PERIOD_CURRENT) continue;
+         int k = ArraySize(g_swTFs); ArrayResize(g_swTFs, k + 1); g_swTFs[k] = t;
+        }
+      if(ArraySize(g_swTFs) > 0) return;
+     }
+   if(InpSwTF1 != PERIOD_CURRENT) { int k = ArraySize(g_swTFs); ArrayResize(g_swTFs, k + 1); g_swTFs[k] = InpSwTF1; }
+   if(InpSwTF2 != PERIOD_CURRENT) { int k = ArraySize(g_swTFs); ArrayResize(g_swTFs, k + 1); g_swTFs[k] = InpSwTF2; }
+  }
+
 string SwTfName(ENUM_TIMEFRAMES tf)
   {
    string s = EnumToString(tf);
@@ -1933,7 +1972,8 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
    SwBase(r, n, atr, e20, e50, s200);
 
    //--- unité supérieure : tendance, Premium / Discount, zones OB / FVG (bougies clôturées seulement)
-   bool htfOn = PeriodSeconds(InpSwHTF) > PeriodSeconds(tf);
+   ENUM_TIMEFRAMES htf = SwHTF(tf);
+   bool htfOn = PeriodSeconds(htf) > PeriodSeconds(tf);
    MqlRates h[];
    ArraySetAsSeries(h, false);
    int m = 0;
@@ -1950,7 +1990,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
    double osB[];
    if(htfOn)
      {
-      m = CopyRates(sym, InpSwHTF, 0, 500, h);
+      m = CopyRates(sym, htf, 0, 500, h);
       if(m < 210) return false;
       ArrayResize(hSma, m); ArrayResize(hHi, m); ArrayResize(hLo, m);
       ArrayResize(zbT, m); ArrayResize(zbB, m); ArrayResize(zsT, m); ArrayResize(zsB, m);
@@ -2408,9 +2448,9 @@ void SwProcess(bool allowed)
          string asset = g_biasAsset[i];
          string sym = ResolveSymbol(asset);
          if(sym == "") continue;
-         for(int u = 0; u < 2; u++)
+         for(int u = 0; u < ArraySize(g_swTFs); u++)
            {
-            ENUM_TIMEFRAMES tf = (u == 0) ? InpSwTF1 : InpSwTF2;
+            ENUM_TIMEFRAMES tf = g_swTFs[u];
             if(tf == PERIOD_CURRENT) continue;
             int ps = PeriodSeconds(tf);
             if(ps < 300 || ps > 86400) continue;
@@ -2714,6 +2754,7 @@ void Cycle()
 int OnInit()
   {
    g_tester = (bool)MQLInfoInteger(MQL_TESTER);
+   SwInitTFs();
    if(g_tester)
      {
       // Testeur de stratégie : pas de GitHub ni de Telegram ; biais, risque et modes viennent des réglages « Testeur ».
