@@ -81,6 +81,10 @@ input bool   InpBreakEven       = true;                 // Stop à l'entrée sur
 input bool   InpFridayClose     = true;                 // Fermer tout le vendredi soir et rester en pause le week-end (règle FTMO)
 input int    InpFridayHour      = 21;                   // Heure de fermeture du vendredi (heure de Paris)
 input int    InpFridayMinute    = 45;                   // Minute de fermeture du vendredi (heure de Paris)
+input bool   InpCryptoWeekend   = false;                // Week-end : SAV-WS continue sur les cryptos (évaluation FTMO ou compte Swing seulement)
+input double InpCryptoWkRiskMult = 0.5;                 // Week-end crypto : multiplicateur du risque par trade (0,5 = moitié)
+input double InpCryptoWkMaxAgeH = 72;                   // Week-end crypto : âge max des consignes (biais du vendredi), en heures
+input string InpCryptoList      = "BTC,ETH,SOL,XRP,LTC,ADA,DOGE,BNB"; // Codes reconnus comme cryptos
 input bool   InpPush            = true;                 // Notifications sur l'application MT5 mobile
 input long   InpMagic           = 77;                   // Identifiant du robot (ne pas changer en cours de route)
 input string InpSymGold         = "";                   // Symbole de l'or (vide = détection auto)
@@ -164,6 +168,7 @@ bool     g_staleSent = false; // alerte « consignes » déjà envoyée
 bool     g_warnSent  = false; // alerte « consignes de plus de N h » déjà envoyée
 bool     g_tester    = false; // testeur de stratégie MT5
 string   g_btFile    = "oracle_backtest.csv"; // journal du testeur : un fichier par actif (v1.15)
+bool     g_wkCrypto  = false; // v1.15 : week-end en cours avec SAV-WS autorisé sur les cryptos
 string   g_sentLines[];       // dernières lignes de journal mises en file (anti-doublon)
 string   g_symCache[];       // symboles dont l'ATR est suivi
 int      g_atrHandle[];
@@ -1143,6 +1148,7 @@ void ManagePending(bool allowed, string why)
       if(!IsOurs(m)) continue;
       int idnum = MagicId(m);
       string reason = "";
+      if(!allowed && g_wkCrypto && idnum >= 400 && idnum < 500 && IsCrypto(OrderGetString(ORDER_SYMBOL))) continue;   // week-end crypto (v1.15)
       if(!allowed) reason = why;
       else if(idnum >= 400 && idnum < 500) continue;     // ordres SAV-WS : tenus par SwProcess
       else
@@ -1494,6 +1500,7 @@ bool PlaceSavMarket(string asset, string sym, int tfh, SavHit &h)
    if(InpMaxSpreadPct > 0 && (ask - bid) > dist * InpMaxSpreadPct / 100.0) { Print("ORACLE : SAV ", sym, " spread trop large, signal ignoré."); return false; }
 
    double riskPct = MathMin((InpRiskOverride > 0) ? InpRiskOverride : g_risk, InpMaxRiskPct);
+   if(g_wkCrypto && WeekendState() > 0) riskPct *= InpCryptoWkRiskMult;   // week-end crypto : risque réduit (v1.15)
    int streak = LossStreakNow();
    if(InpLossStreak > 0 && streak >= InpLossStreak) riskPct *= InpStreakFactor;
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -1613,6 +1620,21 @@ datetime ParisNow()
    return u + ((u >= summerStart && u < summerEnd) ? 7200 : 3600);
   }
 
+bool IsCrypto(string sym)
+  {
+   string u = sym;
+   StringToUpper(u);
+   string c[];
+   int n = StringSplit(InpCryptoList, ',', c);
+   for(int i = 0; i < n; i++)
+     {
+      string k = c[i];
+      StringTrimLeft(k); StringTrimRight(k); StringToUpper(k);
+      if(k != "" && StringFind(u, k) >= 0) return true;
+     }
+   return false;
+  }
+
 // 0 = semaine normale ; 1 = vendredi après l'heure de fermeture ; 2 = samedi ou dimanche avant 23h
 int WeekendState()
   {
@@ -1633,6 +1655,7 @@ void FridayClose()
      {
       ulong t = PositionGetTicket(i);
       if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
+      if(InpCryptoWeekend && IsCrypto(PositionGetString(POSITION_SYMBOL))) continue;   // crypto : gardée le week-end (v1.15)
       open++;
       if(g_trade.PositionClose(t)) closed++;
      }
@@ -2309,6 +2332,7 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
    if(InpMaxSpreadPct > 0 && (ask - bid) > dist * InpMaxSpreadPct / 100.0) return;
 
    double riskPct = MathMin((InpRiskOverride > 0) ? InpRiskOverride : g_risk, InpMaxRiskPct);
+   if(g_wkCrypto && WeekendState() > 0) riskPct *= InpCryptoWkRiskMult;   // week-end crypto : risque réduit (v1.15)
    int streak = LossStreakNow();
    if(InpLossStreak > 0 && streak >= InpLossStreak) riskPct *= InpStreakFactor;
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -2433,7 +2457,7 @@ void SwProcess(bool allowed)
                     }
                  }
               }
-            if(SwModeNow() == 2) SwSync(sym, tf, idnum, slot, allowed, keep);
+            if(SwModeNow() == 2) SwSync(sym, tf, idnum, slot, allowed || (g_wkCrypto && IsCrypto(sym)), keep);
            }
         }
      }
@@ -2517,6 +2541,7 @@ void WeekendCatchUp()
      {
       ulong t = PositionGetTicket(i);
       if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
+      if(InpCryptoWeekend && IsCrypto(PositionGetString(POSITION_SYMBOL))) continue;
       datetime openUtc = (datetime)PositionGetInteger(POSITION_TIME) - srvOff;
       if(openUtc >= cutUtc) continue;
       n++;
@@ -2649,7 +2674,9 @@ void Cycle()
    string why = (wk > 0) ? "week-end (fermeture du vendredi " + IntegerToString(InpFridayHour) + "h" + StringFormat("%02d", InpFridayMinute) + ")" :
                 !ok ? "consignes illisibles" : stale ? "consignes trop anciennes" : !g_enabled ? "robot coupé par ORACLE (interrupteur)" : black ? "annonce économique" : "";
    bool allowed = (why == "");
-   g_state = allowed ? "actif" : "en pause : " + why;
+   g_wkCrypto = (!allowed && wk > 0 && InpCryptoWeekend && !g_tester && ok && g_enabled && !black && SwModeNow() == 2 &&
+                 TimeGMT() - g_updated < (long)(InpCryptoWkMaxAgeH * 3600));
+   g_state = allowed ? "actif" : g_wkCrypto ? "en pause : week-end (SAV-WS crypto actif, risque x" + DoubleToString(InpCryptoWkRiskMult, 2) + ")" : "en pause : " + why;
    StaleAlert(ok, stale, wk);
 
    ManagePending(allowed, why);
