@@ -88,6 +88,7 @@ for a in accounts:
 # --- journal
 sig, res, days = [], [], []
 ws_setups, ws_res, ws_real = [], [], []
+ws_real_d = []
 seen_bodies = set()
 for c in comments(1):
     if c["body"] in seen_bodies:
@@ -99,12 +100,13 @@ for c in comments(1):
                               entry=f[7], sl=f[8], tp=f[9], rr=f[10], conf=f[12], mode=f[13]))
     elif f[0] == "SAVWS_RESULT" and len(f) >= 9:
         try:
-            ws_res.append(dict(code=f[2], tf=f[4], why=f[7], r=float(f[8])))
+            ws_res.append(dict(code=f[2], tf=f[4], why=f[7], r=float(f[8]), sym=f[3], time=f[6]))
         except ValueError:
             pass
     elif f[0] == "ORACLE_TRADE" and len(f) >= 16 and f[2].startswith("W"):
         try:
             ws_real.append(float(f[15]))
+            ws_real_d.append(dict(sym=f[4], time=f[6], r=float(f[15])))
         except ValueError:
             pass
     if f[0] == "SAV_SIGNAL" and len(f) >= 11:
@@ -136,6 +138,23 @@ def _stats(rs):
                 pf=(round(gain / loss, 2) if loss > 0 else None))
 savws = dict(setups=len(ws_setups), sim=_stats([x["r"] for x in ws_res]), real=_stats(ws_real),
              recent=list(reversed(ws_setups))[:10], target=30)
+# crypto semaine / week-end (v1.15) : heure du journal = heure du serveur FTMO (UTC+2/+3) ;
+# le week-end Paris (vendredi 23h → dimanche 23h) correspond au samedi et au dimanche du serveur.
+CRYPTO = ("BTC", "ETH", "SOL", "XRP", "LTC", "ADA", "DOGE", "BNB")
+def _is_crypto(x):
+    u = (x or "").upper()
+    return any(k in u for k in CRYPTO)
+def _is_wk(t):
+    try:
+        return datetime.datetime.strptime(t[:16], "%Y.%m.%d %H:%M").weekday() >= 5
+    except Exception:
+        return False
+cw_sim = [x for x in ws_res if _is_crypto(x["code"]) or _is_crypto(x.get("sym"))]
+cw_real = [x for x in ws_real_d if _is_crypto(x["sym"])]
+crypto_wk = dict(
+    weekend=dict(sim=_stats([x["r"] for x in cw_sim if _is_wk(x["time"])]), real=_stats([x["r"] for x in cw_real if _is_wk(x["time"])])),
+    semaine=dict(sim=_stats([x["r"] for x in cw_sim if not _is_wk(x["time"])]), real=_stats([x["r"] for x in cw_real if not _is_wk(x["time"])])),
+    rule="20 résultats, ≥ 0,2 R, PF ≥ 1,3, risque divisé par 2")
 # interrupteur crypto week-end : 8e champ de la ligne HEADER du fichier de consignes publié (v1.15)
 cw = None
 try:
@@ -147,7 +166,7 @@ try:
             break
 except Exception:
     pass
-out = dict(accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw,
+out = dict(accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw, crypto_wk=crypto_wk,
            sav=dict(mode=None, signals=list(reversed(sig))[:15], results=results),
            days=list(reversed(days))[:10])
 print(json.dumps(out, ensure_ascii=False))
