@@ -50,8 +50,8 @@ by_login = collections.defaultdict(list)
 for b in beats.values():
     t = datetime.datetime.fromisoformat(b["created"].replace("Z", "+00:00"))
     age = int((now - t).total_seconds() // 60)
-    if age > 7 * 24 * 60:
-        continue                       # compte inactif depuis plus d'une semaine : on ne l'affiche plus
+    if age > 3 * 24 * 60:
+        continue                       # compte silencieux depuis plus de 3 jours (robot retiré) : on ne l'affiche plus
     b["age_min"] = age
     st = b["state"].lower()
     weekday = now.weekday() < 5
