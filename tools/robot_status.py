@@ -136,7 +136,18 @@ def _stats(rs):
                 pf=(round(gain / loss, 2) if loss > 0 else None))
 savws = dict(setups=len(ws_setups), sim=_stats([x["r"] for x in ws_res]), real=_stats(ws_real),
              recent=list(reversed(ws_setups))[:10], target=30)
-out = dict(accounts=accounts, alerts=alerts, biases=biases, savws=savws,
+# interrupteur crypto week-end : 8e champ de la ligne HEADER du fichier de consignes publié (v1.15)
+cw = None
+try:
+    import os
+    for ln in open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "oracle_signals.csv"), encoding="utf-8"):
+        if ln.startswith("HEADER;"):
+            hf = ln.strip().split(";")
+            cw = "actif" if len(hf) > 7 and hf[7] == "1" else "arrêt"
+            break
+except Exception:
+    pass
+out = dict(accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw,
            sav=dict(mode=None, signals=list(reversed(sig))[:15], results=results),
            days=list(reversed(days))[:10])
 print(json.dumps(out, ensure_ascii=False))

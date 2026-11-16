@@ -81,7 +81,7 @@ input bool   InpBreakEven       = true;                 // Stop à l'entrée sur
 input bool   InpFridayClose     = true;                 // Fermer tout le vendredi soir et rester en pause le week-end (règle FTMO)
 input int    InpFridayHour      = 21;                   // Heure de fermeture du vendredi (heure de Paris)
 input int    InpFridayMinute    = 45;                   // Minute de fermeture du vendredi (heure de Paris)
-input bool   InpCryptoWeekend   = false;                // Week-end : SAV-WS continue sur les cryptos (évaluation FTMO ou compte Swing seulement)
+input bool   InpCryptoWeekend   = true;                 // Week-end crypto autorisé (l'interrupteur est dans le plan ORACLE : « Mode crypto week-end robot : actif/arrêt » ; false = jamais)
 input double InpCryptoWkRiskMult = 0.5;                 // Week-end crypto : multiplicateur du risque par trade (0,5 = moitié)
 input double InpCryptoWkMaxAgeH = 72;                   // Week-end crypto : âge max des consignes (biais du vendredi), en heures
 input string InpCryptoList      = "BTC,ETH,SOL,XRP,LTC,ADA,DOGE,BNB"; // Codes reconnus comme cryptos
@@ -173,6 +173,7 @@ string   g_sentLines[];       // dernières lignes de journal mises en file (ant
 string   g_symCache[];       // symboles dont l'ATR est suivi
 int      g_atrHandle[];
 int      g_savMode  = 1;     // SAV-AFS : 0 = arrêt, 1 = observation, 2 = trading (valeur ORACLE)
+int      g_cwMode   = 0;     // crypto le week-end : 0 = arrêt, 1 = actif (valeur ORACLE, 8e champ de HEADER, interrupteur du plan)
 int      g_swMode   = 1;     // SAV-WS : 0 = arrêt, 1 = observation, 2 = trading (valeur ORACLE, 7e champ de HEADER)
 string   g_biasAsset[];      // biais fondamental publié par ORACLE, par actif
 int      g_biasVal[];        // 1 = haussier, -1 = baissier, 0 = neutre
@@ -535,6 +536,7 @@ bool Parse(string txt)
          g_exitMode = (k >= 5 && f[4] == "1") ? 1 : 0;   // 5e champ facultatif : mode de sortie
          g_savMode  = (k >= 6) ? (int)StringToInteger(f[5]) : 1;   // 6e champ facultatif : mode SAV-AFS
          g_swMode   = (k >= 7) ? (int)StringToInteger(f[6]) : 1;   // 7e champ facultatif : mode SAV-WS
+         g_cwMode   = (k >= 8) ? (int)StringToInteger(f[7]) : 0;   // 8e champ facultatif : crypto le week-end (1 = actif) — v1.15
          hdr = true;
         }
       else if(f[0] == "ORDER" && k >= 10)
@@ -1655,7 +1657,7 @@ void FridayClose()
      {
       ulong t = PositionGetTicket(i);
       if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
-      if(InpCryptoWeekend && IsCrypto(PositionGetString(POSITION_SYMBOL))) continue;   // crypto : gardée le week-end (v1.15)
+      if(InpCryptoWeekend && g_cwMode == 1 && IsCrypto(PositionGetString(POSITION_SYMBOL))) continue;   // crypto : gardée le week-end (v1.15)
       open++;
       if(g_trade.PositionClose(t)) closed++;
      }
@@ -2541,7 +2543,7 @@ void WeekendCatchUp()
      {
       ulong t = PositionGetTicket(i);
       if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
-      if(InpCryptoWeekend && IsCrypto(PositionGetString(POSITION_SYMBOL))) continue;
+      if(InpCryptoWeekend && g_cwMode == 1 && IsCrypto(PositionGetString(POSITION_SYMBOL))) continue;
       datetime openUtc = (datetime)PositionGetInteger(POSITION_TIME) - srvOff;
       if(openUtc >= cutUtc) continue;
       n++;
@@ -2674,7 +2676,7 @@ void Cycle()
    string why = (wk > 0) ? "week-end (fermeture du vendredi " + IntegerToString(InpFridayHour) + "h" + StringFormat("%02d", InpFridayMinute) + ")" :
                 !ok ? "consignes illisibles" : stale ? "consignes trop anciennes" : !g_enabled ? "robot coupé par ORACLE (interrupteur)" : black ? "annonce économique" : "";
    bool allowed = (why == "");
-   g_wkCrypto = (!allowed && wk > 0 && InpCryptoWeekend && !g_tester && ok && g_enabled && !black && SwModeNow() == 2 &&
+   g_wkCrypto = (!allowed && wk > 0 && InpCryptoWeekend && g_cwMode == 1 && !g_tester && ok && g_enabled && !black && SwModeNow() == 2 &&
                  TimeGMT() - g_updated < (long)(InpCryptoWkMaxAgeH * 3600));
    g_state = allowed ? "actif" : g_wkCrypto ? "en pause : week-end (SAV-WS crypto actif, risque x" + DoubleToString(InpCryptoWkRiskMult, 2) + ")" : "en pause : " + why;
    StaleAlert(ok, stale, wk);
