@@ -12,7 +12,7 @@
 //|         le signal de vie ; alerte si consignes > 10 h en semaine |
 //|         (sans pause) ; perte max du jour 2,5 % par défaut ; plus |
 //|         de ligne de journal en double ; mode testeur de stratégie|
-//|         MT5 (SAV-WS / SAV-AFS, export oracle_backtest.csv).      |
+//|         MT5 (SAV-WS / SAV-AFS, export oracle_backtest_<actif>.csv)      |
 //|  1.12 : alertes SAV-WS d'observation coupées par défaut (les    |
 //|         résultats restent dans le journal GitHub) ; 5 idées max  |
 //|         par défaut (au lieu de 3).                               |
@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.14"
-#define ORACLE_VERSION "1.14"
+#property version   "1.15"
+#define ORACLE_VERSION "1.15"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -63,6 +63,7 @@ input int    InpMaxTrades       = 5;                    // Nombre max d'idées o
 input double InpMaxSignalAgeH   = 36;                   // Consignes plus vieilles = on annule les ordres en attente
 input bool   InpAlertStale      = true;                 // Alerte Telegram si consignes trop anciennes / illisibles (en semaine)
 input int    InpMaxPerCcySide   = 2;                    // Exposition : trades max dans le même sens sur une même devise (0 = sans limite)
+input int    InpMaxPerEqSide    = 1;                    // Exposition : trades max dans le même sens sur un même bloc d'indices (US500+US100+US30 = actions US ; DAX+CAC+UK100+EU50 = actions Europe) (0 = sans limite)
 input int    InpSwMaxPerDay     = 3;                    // SAV-WS : trades réels max par jour
 input bool   InpUseCalendar     = true;                 // Pause automatique autour des annonces à fort impact (calendrier économique MT5)
 input int    InpCalMinutes      = 15;                   // Minutes de pause avant et après une annonce à fort impact
@@ -162,6 +163,7 @@ datetime g_lastOk    = 0;    // dernière lecture réussie des consignes (GMT)
 bool     g_staleSent = false; // alerte « consignes » déjà envoyée
 bool     g_warnSent  = false; // alerte « consignes de plus de N h » déjà envoyée
 bool     g_tester    = false; // testeur de stratégie MT5
+string   g_btFile    = "oracle_backtest.csv"; // journal du testeur : un fichier par actif (v1.15)
 string   g_sentLines[];       // dernières lignes de journal mises en file (anti-doublon)
 string   g_symCache[];       // symboles dont l'ATR est suivi
 int      g_atrHandle[];
@@ -297,7 +299,7 @@ void FlushQueues()
 
 void JournalLocal(string line)
   {
-   int h = g_tester ? FileOpen("oracle_backtest.csv", FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ | FILE_COMMON)
+   int h = g_tester ? FileOpen(g_btFile, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ | FILE_COMMON)
                     : FileOpen("oracle_journal.csv", FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_SHARE_READ);
    if(h == INVALID_HANDLE) return;
    FileSeek(h, 0, SEEK_END);
@@ -865,14 +867,45 @@ int LossStreakNow()
 //| v1.14 : exposition par devise, limite SAV-WS du jour, calendrier,|
 //| alerte de nouvelle version                                       |
 //+------------------------------------------------------------------+
+// Expositions d'un trade (v1.15) : paire de devises → devise achetée / devise vendue ;
+// indice actions → bloc « EQ_US », « EQ_EU » ou « EQ_JP » (acheté ou vendu). Faux si l'actif n'entre dans aucun groupe.
+string EqBlock(string sym)
+  {
+   string u = sym;
+   StringToUpper(u);
+   string us[] = {"US500", "US100", "US30", "SPX", "NAS", "USTEC", "DJ", "NDX", "SP500", "US2000"};
+   string eu[] = {"GER40", "DE40", "DAX", "FRA40", "CAC", "UK100", "FTSE", "EU50", "STOXX", "ESP35", "NETH25"};
+   for(int i = 0; i < ArraySize(us); i++) if(StringFind(u, us[i]) >= 0) return "EQ_US";
+   for(int i = 0; i < ArraySize(eu); i++) if(StringFind(u, eu[i]) >= 0) return "EQ_EU";
+   if(StringFind(u, "JP225") >= 0 || StringFind(u, "NIKKEI") >= 0 || StringFind(u, "JPN225") >= 0) return "EQ_JP";
+   return "";
+  }
+
+bool ExpoLegs(string sym, bool buy, string &lng, string &sht)
+  {
+   lng = ""; sht = "";
+   string eq = EqBlock(sym);
+   if(eq != "")
+     {
+      if(InpMaxPerEqSide <= 0) return false;
+      if(buy) lng = eq; else sht = eq;
+      return true;
+     }
+   if(InpMaxPerCcySide <= 0) return false;
+   string b = SymbolInfoString(sym, SYMBOL_CURRENCY_BASE), q = SymbolInfoString(sym, SYMBOL_CURRENCY_PROFIT);
+   if(b == "" || q == "" || b == q) return false;
+   lng = buy ? b : q;
+   sht = buy ? q : b;
+   return true;
+  }
+
 // Refuse un nouveau trade si InpMaxPerCcySide trades (positions ou ordres, une idée comptée une fois)
 // sont déjà dans le même sens sur la devise de base ou de cotation (ex. 2 ventes de dollar déjà en cours).
 bool CcyExposureOK(string sym, bool buy, int selfId)
   {
-   if(InpMaxPerCcySide <= 0) return true;
-   string b = SymbolInfoString(sym, SYMBOL_CURRENCY_BASE), q = SymbolInfoString(sym, SYMBOL_CURRENCY_PROFIT);
-   if(b == "" || q == "" || b == q) return true;
-   string myL = buy ? b : q, myS = buy ? q : b;
+   if(InpMaxPerCcySide <= 0 && InpMaxPerEqSide <= 0) return true;
+   string myL = "", myS = "";
+   if(!ExpoLegs(sym, buy, myL, myS)) return true;
    int nL = 0, nS = 0;
    int seen[];
    ArrayResize(seen, 0);
@@ -909,16 +942,18 @@ bool CcyExposureOK(string sym, bool buy, int selfId)
          int ns = ArraySize(seen);
          ArrayResize(seen, ns + 1);
          seen[ns] = id;
-         string b3 = SymbolInfoString(s2, SYMBOL_CURRENCY_BASE), q3 = SymbolInfoString(s2, SYMBOL_CURRENCY_PROFIT);
-         if(b3 == "" || q3 == "" || b3 == q3) continue;
-         string lng = b2 ? b3 : q3, sht = b2 ? q3 : b3;
-         if(lng == myL) nL++;
-         if(sht == myS) nS++;
+         string lng = "", sht = "";
+         if(!ExpoLegs(s2, b2, lng, sht)) continue;
+         if(lng != "" && lng == myL) nL++;
+         if(sht != "" && sht == myS) nS++;
         }
      }
-   if(nL >= InpMaxPerCcySide || nS >= InpMaxPerCcySide)
+   int capL = (StringFind(myL, "EQ_") == 0) ? InpMaxPerEqSide : InpMaxPerCcySide;
+   int capS = (StringFind(myS, "EQ_") == 0) ? InpMaxPerEqSide : InpMaxPerCcySide;
+   bool hitL = (myL != "" && capL > 0 && nL >= capL), hitS = (myS != "" && capS > 0 && nS >= capS);
+   if(hitL || hitS)
      {
-      Print("ORACLE : ", sym, " non pris : déjà ", MathMax(nL, nS), " trade(s) dans le même sens sur ", (nL >= InpMaxPerCcySide ? myL : myS), " (plafond d'exposition par devise).");
+      Print("ORACLE : ", sym, " non pris : déjà ", (hitL ? nL : nS), " trade(s) dans le même sens sur ", (hitL ? myL : myS), " (plafond d'exposition).");
       return false;
      }
    return true;
@@ -2657,7 +2692,10 @@ int OnInit()
       g_biasAsset[0] = "TEST"; g_biasVal[0] = InpTestBias;
       g_risk = InpTestRisk; g_enabled = true; g_updated = TimeGMT();
       g_swMode = InpTestSwMode; g_savMode = InpTestSavMode; g_nsig = 0;
-      FileDelete("oracle_backtest.csv", FILE_COMMON);
+      string bs = _Symbol;
+      StringReplace(bs, "/", "");
+      g_btFile = "oracle_backtest_" + bs + ".csv";   // un fichier par actif : les tests successifs ne s'effacent plus
+      FileDelete(g_btFile, FILE_COMMON);
       g_trade.SetDeviationInPoints(30);
       EventSetTimer(MathMax(10, InpPollSeconds));
       return INIT_SUCCEEDED;
