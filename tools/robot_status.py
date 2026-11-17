@@ -72,15 +72,18 @@ for a in accounts:
     elif a["flag"] == "silence":
         alerts.append(f"Compte •••{a['login'][-3:]} : aucun signal de vie depuis {a['age_min']} min (PC, réseau ou MT5 coupé ?)")
 # deux robots sur le meme compte : plus de signaux de vie que prevu sur les 3 dernieres heures (1 par heure attendu)
+# v1.19 : une réinstallation envoie plusieurs signaux en quelques minutes ; on n'alerte que si au moins
+# deux heures différentes (sur les 3 dernières) comptent chacune 2 signaux ou plus
 cnt = collections.Counter()
 for c in comments(2)[-300:]:
     f = c["body"].split(";")
     if f[0] == "HEARTBEAT" and len(f) > 6:
         t = datetime.datetime.fromisoformat(c["created_at"].replace("Z", "+00:00"))
         if (now - t).total_seconds() < 3 * 3600:
-            cnt[f[1]] += 1
-for login, k in cnt.items():
-    if k >= 5:
+            cnt[(f[1], t.strftime("%d%H"))] += 1
+dbl = collections.Counter(login for (login, h), k in cnt.items() if k >= 2)
+for login, k in dbl.items():
+    if k >= 2:
         alerts.append(f"Compte •••{login[-3:]} : deux robots semblent tourner sur le même compte (à retirer d'un des deux MetaTrader)")
 # v1.19 : contrôle des réglages clés envoyés par le robot (profil validé le 17/11)
 EXPECT = dict(idees="6", swUnites="H1", swConfReel="3", swZone="oui", swTendance="oui")
