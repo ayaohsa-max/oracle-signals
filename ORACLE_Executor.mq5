@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.15"
-#define ORACLE_VERSION "1.15"
+#property version   "1.16"
+#define ORACLE_VERSION "1.16"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -110,9 +110,11 @@ input double InpSavFibMin       = 0.5;                  // SAV-AFS : début de l
 input double InpSavFibMax       = 0.786;                // SAV-AFS : fin de la zone de retracement
 input int    InpSavMaxBars      = 60;                   // SAV-AFS : durée max d'une étape (bougies)
 input int    InpSwMode          = -1;                   // SAV-WS : -1 = selon ORACLE, 0 = arrêt, 1 = observation, 2 = trading
-input ENUM_TIMEFRAMES InpSwTF1  = PERIOD_M15;           // SAV-WS : unité 1 (Actuelle = désactivée)
+input ENUM_TIMEFRAMES InpSwTF1  = PERIOD_CURRENT;       // SAV-WS : unité 1 (Actuelle = désactivée ; M15 coupé en v1.16 : perdant sur 3 ans)
 input ENUM_TIMEFRAMES InpSwTF2  = PERIOD_H1;            // SAV-WS : unité 2 (Actuelle = désactivée)
-input string InpTestSwTFs       = "M15,H1,H2,H4,D1";    // Testeur : unités SAV-WS testées ensemble (vide = unités 1 et 2)
+input string InpTestSwTFs       = "";                   // Testeur : unités SAV-WS testées ensemble, ex. « M15,H1,H4 » (vide = unités 1 et 2)
+input bool   InpSwNeedHTFZone   = true;                 // SAV-WS en réel : zone de l'unité supérieure obligatoire (v1.16 : +0,06 R contre −0,03 R sur 3 ans en H1)
+input string InpSwTradeList     = "BTC,USDCAD";         // SAV-WS en réel : actifs tradés (les autres restent en simulation) ; vide = tous
 input ENUM_TIMEFRAMES InpSwHTF  = PERIOD_H4;            // SAV-WS : unité supérieure (tendance, Premium/Discount, zones)
 input bool   InpSwNotify        = false;                // SAV-WS : Telegram / mobile pour chaque setup en observation
 input int    InpSwPivot         = 5;                    // SAV-WS : longueur des pivots
@@ -2323,6 +2325,23 @@ bool SwOpposite(string sym, bool buy, int idnum)
   }
 
 //--- Tient l'ordre limite SAV-WS d'un actif / unité aligné sur le dernier calcul (mode trading)
+// v1.16 : SAV-WS ne passe d'ordres réels que sur les actifs de InpSwTradeList (vide = tous)
+bool SwTradeAllowed(string sym)
+  {
+   if(InpSwTradeList == "") return true;
+   string u = sym;
+   StringToUpper(u);
+   string c[];
+   int n = StringSplit(InpSwTradeList, ',', c);
+   for(int i = 0; i < n; i++)
+     {
+      string k = c[i];
+      StringTrimLeft(k); StringTrimRight(k); StringToUpper(k);
+      if(k != "" && StringFind(u, k) >= 0) return true;
+     }
+   return false;
+  }
+
 void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, int &keep[])
   {
    ulong pt = 0;
@@ -2344,6 +2363,8 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
      }
    if(!allowed || g_swState[slot] != 1) return;          // l'ordre éventuel sera retiré par le balayage final
    if(InpSwMaxPerDay > 0 && SwDayCount() >= InpSwMaxPerDay) return;   // limite du jour atteinte : ordre retiré
+   if(InpSwNeedHTFZone && StringFind(g_swConf[slot], "ZoneHTF") < 0) return;   // v1.16 : sans zone HTF, simulation seulement
+   if(!SwTradeAllowed(sym)) return;                                            // v1.16 : actif hors liste, simulation seulement
 
    bool buy = g_swBuy[slot];
    double e  = RoundPrice(sym, g_swE[slot]);
