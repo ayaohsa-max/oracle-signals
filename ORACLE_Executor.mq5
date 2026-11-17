@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.18"
-#define ORACLE_VERSION "1.18"
+#property version   "1.19"
+#define ORACLE_VERSION "1.19"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -2050,6 +2050,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
    bool bValid = false, bChoch = false, bMss = false, bKz = false;
    bool bBeOn = false, bBeOut = false;
    int  bBeBar = -1;
+   double bMfe = 0;   // v1.19 : gain maximal atteint en R
    // vente
    int sState = 0, sOIdx = -1, sStart = -1, sFill = -1;
    double sO = 0, sExt = 0, sEntry = 0, sEL = 0, sSL = 0, sTP = 0, sRR = 0;
@@ -2057,6 +2058,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
    bool sValid = false, sChoch = false, sMss = false, sKz = false;
    bool sBeOn = false, sBeOut = false;
    int  sBeBar = -1;
+   double sMfe = 0;
 
    for(int t = 1; t <= last; t++)
      {
@@ -2146,7 +2148,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
         {
          if(bValid && r[t].low <= bEntry)
            {
-            bState = 2; bFill = t; bBeOn = false; bBeOut = false; bBeBar = -1;
+            bState = 2; bFill = t; bBeOn = false; bBeOut = false; bBeBar = -1; bMfe = 0;
             if(t == last) Print("ORACLE : SAV-WS ", sym, " ", SwTfName(tf), " achat déclenché à ", DoubleToString(bEntry, dg));
            }
          else if(r[t].high > bExt) { bExt = r[t].high; bEval = true; }
@@ -2186,6 +2188,8 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
          if(!bBeOn && t > bFill && bRisk > 0 && r[t].high >= bEntry + InpSwBeAtR * bRisk) { bBeOn = true; bBeBar = t; }
          bool hitSL = r[t].low <= bSL;
          bool hitTP = t > bFill && r[t].high >= bTP;
+         if(t > bFill && !hitSL && bRisk > 0) bMfe = MathMax(bMfe, (r[t].high - bEntry) / bRisk);
+         if(hitTP) bMfe = MathMax(bMfe, bRR);
          if(hitSL || hitTP)
            {
             if(t == last)
@@ -2193,8 +2197,8 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
                double cost = (bRisk > 0) ? spr / bRisk : 0;
                double R = (hitSL ? -1.0 : bRR) - cost;
                double Rbe = bBeOut ? -cost : R;
-               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f;%.2f;%d", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
-                                               hitSL ? "stop" : "objectif", R, Rbe, bFill - bStart));   // v1.18 : délai d'entrée en bougies
+               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f;%.2f;%d;%.2f", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R, Rbe, bFill - bStart, bMfe));   // v1.18 : délai d'entrée en bougies
               }
             bState = 0;
            }
@@ -2220,7 +2224,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
         {
          if(sValid && r[t].high >= sEntry)
            {
-            sState = 2; sFill = t; sBeOn = false; sBeOut = false; sBeBar = -1;
+            sState = 2; sFill = t; sBeOn = false; sBeOut = false; sBeBar = -1; sMfe = 0;
             if(t == last) Print("ORACLE : SAV-WS ", sym, " ", SwTfName(tf), " vente déclenchée à ", DoubleToString(sEntry, dg));
            }
          else if(r[t].low < sExt) { sExt = r[t].low; sEval = true; }
@@ -2259,6 +2263,8 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
          if(!sBeOn && t > sFill && sRisk > 0 && r[t].low <= sEntry - InpSwBeAtR * sRisk) { sBeOn = true; sBeBar = t; }
          bool hitSL = r[t].high >= sSL;
          bool hitTP = t > sFill && r[t].low <= sTP;
+         if(t > sFill && !hitSL && sRisk > 0) sMfe = MathMax(sMfe, (sEntry - r[t].low) / sRisk);
+         if(hitTP) sMfe = MathMax(sMfe, sRR);
          if(hitSL || hitTP)
            {
             if(t == last)
@@ -2266,8 +2272,8 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
                double cost = (sRisk > 0) ? spr / sRisk : 0;
                double R = (hitSL ? -1.0 : sRR) - cost;
                double Rbe = sBeOut ? -cost : R;
-               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f;%.2f;%d", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
-                                               hitSL ? "stop" : "objectif", R, Rbe, sFill - sStart));   // v1.18 : délai d'entrée en bougies
+               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f;%.2f;%d;%.2f", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R, Rbe, sFill - sStart, sMfe));   // v1.18 : délai d'entrée en bougies
               }
             sState = 0;
            }
@@ -2345,6 +2351,53 @@ int SwTrendAlign(string sym, bool buy, datetime t)
    if(last == ma) return 0;
    bool up = last > ma;
    return (up == buy) ? 1 : -1;
+  }
+
+// v1.19 : régime de marché au moment du setup (journalier, bougies closes avant t) :
+// « ADX14;distance à la moyenne de tendance en ATR14 (signée);ATR14/ATR100 »
+string SwRegime(string sym, datetime t)
+  {
+   int sh = iBarShift(sym, PERIOD_D1, t, false);
+   if(sh < 0) return "-;-;-";
+   int need = MathMax(InpSwTrendMA, 130);
+   MqlRates d[];
+   ArraySetAsSeries(d, false);
+   int m = CopyRates(sym, PERIOD_D1, sh + 1, need, d);
+   if(m < 130) return "-;-;-";
+   // ATR 14 et 100 (moyenne simple des vrais ranges)
+   double tr[]; ArrayResize(tr, m);
+   for(int i = 0; i < m; i++)
+     {
+      double hl = d[i].high - d[i].low;
+      if(i > 0) hl = MathMax(hl, MathMax(MathAbs(d[i].high - d[i - 1].close), MathAbs(d[i].low - d[i - 1].close)));
+      tr[i] = hl;
+     }
+   double a14 = 0, a100 = 0;
+   for(int i = m - 14; i < m; i++) a14 += tr[i];
+   a14 /= 14;
+   for(int i = m - 100; i < m; i++) a100 += tr[i];
+   a100 /= 100;
+   // ADX 14 (Wilder)
+   double sTR = 0, sP = 0, sM = 0, adx = 0;
+   int k = 0;
+   for(int i = 1; i < m; i++)
+     {
+      double up = d[i].high - d[i - 1].high, dn = d[i - 1].low - d[i].low;
+      double pdm = (up > dn && up > 0) ? up : 0, mdm = (dn > up && dn > 0) ? dn : 0;
+      if(i <= 14) { sTR += tr[i]; sP += pdm; sM += mdm; if(i < 14) continue; }
+      else { sTR = sTR - sTR / 14 + tr[i]; sP = sP - sP / 14 + pdm; sM = sM - sM / 14 + mdm; }
+      double pdi = (sTR > 0) ? 100 * sP / sTR : 0, mdi = (sTR > 0) ? 100 * sM / sTR : 0;
+      double dx = (pdi + mdi > 0) ? 100 * MathAbs(pdi - mdi) / (pdi + mdi) : 0;
+      k++;
+      if(k <= 14) { adx += dx / 14.0; }
+      else adx = (adx * 13 + dx) / 14;
+     }
+   double dist = 0;
+   int n = MathMin(InpSwTrendMA, m);
+   double sum = 0;
+   for(int i = m - n; i < m; i++) sum += d[i].close;
+   if(a14 > 0) dist = (d[m - 1].close - sum / n) / a14;
+   return StringFormat("%.1f;%.2f;%.2f", adx, dist, (a100 > 0) ? a14 / a100 : 0);
   }
 
 int SwConfCount(string conf)
@@ -2558,16 +2611,16 @@ void SwProcess(bool allowed)
                            int al = SwTrendAlign(sym, f[1] == "BUY", StringToTime(f[2]));
                            SavJournal(StringFormat("SAVWS_SETUP;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
                                                    asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], modeTxt,
-                                                   al > 0 ? "TEND" : (al < 0 ? "CONTRE" : "-")));
+                                                   al > 0 ? "TEND" : (al < 0 ? "CONTRE" : "-")) + ";" + SwRegime(sym, StringToTime(f[2])));   // v1.19 : ADX;distance;volatilité
                            if(SwModeNow() == 1 && InpSwNotify)
                               Notify(StringFormat("SAV-WS %s %s %s (observation) : limite %s, stop %s, objectif %s, %sR | %s",
                                                   SwTfName(tf), sym, f[1] == "BUY" ? "achat" : "vente", f[3], f[4], f[5], f[6], f[8]));
                           }
                         else if(f[0] == "RESULT")
                           {
-                           SavJournal(StringFormat("SAVWS_RESULT;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
+                           SavJournal(StringFormat("SAVWS_RESULT;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
                                                    asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], SwModeNow() == 2 ? "SIM" : "OBS",
-                                                   nf >= 6 ? f[5] : f[4], nf >= 7 ? f[6] : "-"));   // v1.18 : 12e champ = délai d'entrée (bougies)
+                                                   nf >= 6 ? f[5] : f[4], nf >= 7 ? f[6] : "-", nf >= 8 ? f[7] : "-"));   // v1.19 : 13e champ = gain maximal en R   // v1.18 : 12e champ = délai d'entrée (bougies)
                            if(SwModeNow() == 1 && InpSwNotify)
                               Notify(StringFormat("SAV-WS %s %s %s (observation) : %s, %sR", SwTfName(tf), sym,
                                                   f[1] == "BUY" ? "achat" : "vente", f[3], f[4]));
