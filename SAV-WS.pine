@@ -2,7 +2,8 @@
 // ════════════════════════════════════════════════════════════════════
 // SAV-WS — Filtres SAV-AFS (biais, tendance UT supérieure, moyennes)
 //          + entrée WinStructure (structure, Fibo, confluences)
-// Unités de temps : 5 min à 1 jour
+// Unités de temps : 5 min à 1 jour (profil ORACLE v1.17 : H1, UT supérieure H4, zone HTF obligatoire,
+//   3 confluences minimum, tendance de fond D1 vs moyenne 200 jours ; or à éviter)
 // Fibo : 0 = extrême de l'impulsion, 1 = origine de l'impulsion
 // Entrée : 0.618 / 0.705 / 0.786 / 0.893 / 1 si confluences
 //   (OB, FVG, Sweep, MSS, Premium/Discount, Killzone, PDH/PDL/Asie, zone HTF)
@@ -50,7 +51,8 @@ kzNY     = input.session("1300-1600", "Killzone New York", group = G3)
 useLiq   = input.bool(true, "Sweep du PDH / PDL ou du range asiatique", group = G3)
 asiaSes  = input.session("0100-0600", "Range asiatique", group = G3)
 useHZ    = input.bool(true, "Zone d'entrée dans un OB / FVG de l'UT supérieure", group = G3)
-minConf  = input.int(2, "Confluences minimum", minval = 0, maxval = 7, group = G3, tooltip = "Comptées : OB, FVG, liquidité (1 point même si plusieurs), MSS, Premium/Discount, Killzone, zone HTF. BOS/CHoCH = déclencheur, non compté.")
+needHZ   = input.bool(true, "Zone de l'UT supérieure obligatoire (comme le robot v1.17)", group = G3)
+minConf  = input.int(3, "Confluences minimum", minval = 0, maxval = 7, group = G3, tooltip = "Comptées : OB, FVG, liquidité (1 point même si plusieurs), MSS, Premium/Discount, Killzone, zone HTF. BOS/CHoCH = déclencheur, non compté.")
 needKey  = input.bool(true, "Exiger une zone ou une liquidité (OB, FVG, Sweep, PDH/PDL/Asie, zone HTF)", group = G3)
 obLook   = input.int(10, "Recherche de l'OB (bougies avant l'origine)", minval = 1, maxval = 50, group = G3)
 slBuf    = input.float(0.2, "Marge du stop (x ATR 14)", minval = 0, step = 0.05, group = G3)
@@ -64,6 +66,7 @@ useHTF   = input.bool(true, "Tendance unité supérieure (prix vs SMA lente)", g
 htfTF    = input.timeframe("240", "Unité supérieure", group = G4)
 useAlign = input.bool(true, "Alignement EMA 20 > EMA 50 > SMA lente (inverse en vente)", group = G4)
 maLen    = input.int(200, "Période SMA lente", minval = 10, group = G4)
+useD1    = input.bool(true, "Tendance de fond obligatoire : clôture journalière vs moyenne 200 jours (robot v1.17)", group = G4)
 useSess  = input.bool(false, "Trader seulement pendant la session", group = G4)
 sess     = input.session("0800-1700", "Horaires de session", group = G4)
 sessTZ   = input.string("Europe/Paris", "Fuseau horaire", group = G4)
@@ -83,6 +86,9 @@ htfOn = useHTF and timeframe.in_seconds(htfTF) > tfSec
 [hC, hM] = request.security(syminfo.tickerid, htfTF, [close[1], ta.sma(close, maLen)[1]], lookahead = barmerge.lookahead_on)
 htfBull  = not htfOn or hC > hM
 htfBear  = not htfOn or hC < hM
+[dC, dM] = request.security(syminfo.tickerid, "D", [close[1], ta.sma(close, 200)[1]], lookahead = barmerge.lookahead_on)
+d1Bull   = not useD1 or (not na(dM) and dC > dM)
+d1Bear   = not useD1 or (not na(dM) and dC < dM)
 alBull   = not useAlign or (ema20 > ema50 and ema50 > ma)
 alBear   = not useAlign or (ema20 < ema50 and ema50 < ma)
 inSess   = not useSess or not na(time(timeframe.period, sess, sessTZ))
@@ -520,7 +526,7 @@ if bEvalNow
     int xCnt = array.size(xParts)
     xCnt  -= lqOk and str.contains(eConf, "Sweep") ? 1 : 0
     bConf  := array.size(xParts) > 0 ? eConf + (eCnt > 0 ? "+" : " | ") + array.join(xParts, "+") : eConf
-    bValid := eCnt + xCnt >= minConf and eRR >= minRR and (eKey or lqOk or hzOk or not needKey)
+    bValid := eCnt + xCnt >= minConf and eRR >= minRR and (eKey or lqOk or hzOk or not needKey) and (not needHZ or hzOk) and d1Bull
     f_clear(bLines, bBoxes, bLabs)
     label.delete(bTag)
     if bValid
@@ -646,7 +652,7 @@ if sEvalNow
     int xCnt = array.size(xParts)
     xCnt  -= lqOk and str.contains(eConf, "Sweep") ? 1 : 0
     sConf  := array.size(xParts) > 0 ? eConf + (eCnt > 0 ? "+" : " | ") + array.join(xParts, "+") : eConf
-    sValid := eCnt + xCnt >= minConf and eRR >= minRR and (eKey or lqOk or hzOk or not needKey)
+    sValid := eCnt + xCnt >= minConf and eRR >= minRR and (eKey or lqOk or hzOk or not needKey) and (not needHZ or hzOk) and d1Bear
     f_clear(sLines, sBoxes, sLabs)
     label.delete(sTag)
     if sValid
