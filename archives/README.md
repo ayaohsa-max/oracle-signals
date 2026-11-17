@@ -8,6 +8,7 @@ Pour revenir à une version : ouvre le fichier, copie tout le code dans MetaEdit
 
 | Version | Date | Changements | Fichier |
 |---|---|---|---|
+| v1.18 | 17/11/2026 | Délai d'entrée SAV-WS (bougies entre le setup et l'exécution) noté dans le journal, pour choisir la meilleure durée de validité | [code](robot/ORACLE_Executor_v1.18.mq5) |
 | v1.17 | 17/11/2026 | SAV-WS en réel : tendance de fond obligatoire (moyenne 200 jours), 3 confluences minimum, or exclu ; journal des setups marqué dans/contre la tendance | [code](robot/ORACLE_Executor_v1.17.mq5) |
 | v1.16 | 17/11/2026 | SAV-WS en H1 seul, zone de l'unité supérieure obligatoire en réel, liste d'actifs tradés (tous par défaut) | [code](robot/ORACLE_Executor_v1.16.mq5) |
 | v1.15 | 16/11/2026 | Journal de backtest par actif, indices groupés par bloc dans le plafond d'exposition, crypto le week-end (interrupteur du plan), testeur multi-unités | [code](robot/ORACLE_Executor_v1.15.mq5) |

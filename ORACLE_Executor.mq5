@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.17"
-#define ORACLE_VERSION "1.17"
+#property version   "1.18"
+#define ORACLE_VERSION "1.18"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -2193,8 +2193,8 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
                double cost = (bRisk > 0) ? spr / bRisk : 0;
                double R = (hitSL ? -1.0 : bRR) - cost;
                double Rbe = bBeOut ? -cost : R;
-               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f;%.2f", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
-                                               hitSL ? "stop" : "objectif", R, Rbe));
+               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f;%.2f;%d", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R, Rbe, bFill - bStart));   // v1.18 : délai d'entrée en bougies
               }
             bState = 0;
            }
@@ -2266,8 +2266,8 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
                double cost = (sRisk > 0) ? spr / sRisk : 0;
                double R = (hitSL ? -1.0 : sRR) - cost;
                double Rbe = sBeOut ? -cost : R;
-               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f;%.2f", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
-                                               hitSL ? "stop" : "objectif", R, Rbe));
+               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f;%.2f;%d", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R, Rbe, sFill - sStart));   // v1.18 : délai d'entrée en bougies
               }
             sState = 0;
            }
@@ -2565,9 +2565,9 @@ void SwProcess(bool allowed)
                           }
                         else if(f[0] == "RESULT")
                           {
-                           SavJournal(StringFormat("SAVWS_RESULT;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
+                           SavJournal(StringFormat("SAVWS_RESULT;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
                                                    asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], SwModeNow() == 2 ? "SIM" : "OBS",
-                                                   nf >= 6 ? f[5] : f[4]));
+                                                   nf >= 6 ? f[5] : f[4], nf >= 7 ? f[6] : "-"));   // v1.18 : 12e champ = délai d'entrée (bougies)
                            if(SwModeNow() == 1 && InpSwNotify)
                               Notify(StringFormat("SAV-WS %s %s %s (observation) : %s, %sR", SwTfName(tf), sym,
                                                   f[1] == "BUY" ? "achat" : "vente", f[3], f[4]));
