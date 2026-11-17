@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.16"
-#define ORACLE_VERSION "1.16"
+#property version   "1.17"
+#define ORACLE_VERSION "1.17"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -114,6 +114,10 @@ input ENUM_TIMEFRAMES InpSwTF1  = PERIOD_CURRENT;       // SAV-WS : unité 1 (Ac
 input ENUM_TIMEFRAMES InpSwTF2  = PERIOD_H1;            // SAV-WS : unité 2 (Actuelle = désactivée)
 input string InpTestSwTFs       = "";                   // Testeur : unités SAV-WS testées ensemble, ex. « M15,H1,H4 » (vide = unités 1 et 2)
 input bool   InpSwNeedHTFZone   = true;                 // SAV-WS en réel : zone de l'unité supérieure obligatoire (v1.16 : +0,06 R contre −0,03 R sur 3 ans en H1)
+input bool   InpSwTrendFilter   = true;                 // SAV-WS en réel : sens de la tendance de fond obligatoire (v1.17 : prix contre moyenne 200 jours)
+input int    InpSwTrendMA       = 200;                  // SAV-WS : période de la moyenne de tendance (journalier)
+input int    InpSwMinConfReal   = 3;                    // SAV-WS en réel : confluences minimum (v1.17 ; la détection garde InpSwMinConf)
+input string InpSwExclude       = "XAU";                // SAV-WS en réel : actifs exclus (v1.17 : l'or perd dans toutes les unités) ; vide = aucun
 input string InpSwTradeList     = "";                   // SAV-WS en réel : actifs tradés, ex. « BTC,USDCAD » (les autres restent en simulation) ; vide = tous (choix du trader le 17/11)
 input ENUM_TIMEFRAMES InpSwHTF  = PERIOD_H4;            // SAV-WS : unité supérieure (tendance, Premium/Discount, zones)
 input bool   InpSwNotify        = false;                // SAV-WS : Telegram / mobile pour chaque setup en observation
@@ -1730,6 +1734,7 @@ void SwReset(SwRes &x)
 // mémoire du dernier calcul, par actif et par unité
 string   g_swKey[];
 datetime g_swBar[];
+int      g_swAlign[];   // v1.17 : 1 = setup dans le sens de la tendance de fond, -1 = contre, 0 = inconnu
 int      g_swState[];
 bool     g_swBuy[];
 double   g_swE[];
@@ -1745,9 +1750,9 @@ int SwSlot(string key)
    for(int i = 0; i < n; i++) if(g_swKey[i] == key) return i;
    ArrayResize(g_swKey, n + 1); ArrayResize(g_swBar, n + 1); ArrayResize(g_swState, n + 1); ArrayResize(g_swBuy, n + 1);
    ArrayResize(g_swE, n + 1); ArrayResize(g_swSL, n + 1); ArrayResize(g_swTP, n + 1); ArrayResize(g_swRR, n + 1);
-   ArrayResize(g_swLvl, n + 1); ArrayResize(g_swConf, n + 1);
+   ArrayResize(g_swLvl, n + 1); ArrayResize(g_swConf, n + 1); ArrayResize(g_swAlign, n + 1);
    g_swKey[n] = key; g_swBar[n] = 0; g_swState[n] = 0; g_swBuy[n] = true;
-   g_swE[n] = 0; g_swSL[n] = 0; g_swTP[n] = 0; g_swRR[n] = 0; g_swLvl[n] = 0; g_swConf[n] = "";
+   g_swE[n] = 0; g_swSL[n] = 0; g_swTP[n] = 0; g_swRR[n] = 0; g_swLvl[n] = 0; g_swConf[n] = ""; g_swAlign[n] = 0;
    return n;
   }
 
@@ -2325,6 +2330,51 @@ bool SwOpposite(string sym, bool buy, int idnum)
   }
 
 //--- Tient l'ordre limite SAV-WS d'un actif / unité aligné sur le dernier calcul (mode trading)
+// v1.17 : tendance de fond = dernière clôture journalière avant t contre sa moyenne InpSwTrendMA jours.
+// 1 = le sens (achat/vente) suit la tendance, -1 = contre, 0 = historique insuffisant.
+int SwTrendAlign(string sym, bool buy, datetime t)
+  {
+   if(InpSwTrendMA < 2) return 0;
+   int sh = iBarShift(sym, PERIOD_D1, t, false);
+   if(sh < 0) return 0;
+   double c[];
+   if(CopyClose(sym, PERIOD_D1, sh + 1, InpSwTrendMA, c) < InpSwTrendMA) return 0;
+   double sum = 0;
+   for(int i = 0; i < InpSwTrendMA; i++) sum += c[i];
+   double ma = sum / InpSwTrendMA, last = c[InpSwTrendMA - 1];
+   if(last == ma) return 0;
+   bool up = last > ma;
+   return (up == buy) ? 1 : -1;
+  }
+
+int SwConfCount(string conf)
+  {
+   int k = StringFind(conf, "|");
+   string tail = (k >= 0) ? StringSubstr(conf, k + 1) : conf;
+   StringTrimLeft(tail); StringTrimRight(tail);
+   if(tail == "") return 0;
+   string p[];
+   int n = StringSplit(tail, '+', p), cnt = 0;
+   for(int i = 0; i < n; i++) { string q = p[i]; StringTrimLeft(q); StringTrimRight(q); if(q != "") cnt++; }
+   return cnt;
+  }
+
+bool SwInList(string sym, string list)
+  {
+   if(list == "") return false;
+   string u = sym;
+   StringToUpper(u);
+   string c[];
+   int n = StringSplit(list, ',', c);
+   for(int i = 0; i < n; i++)
+     {
+      string k = c[i];
+      StringTrimLeft(k); StringTrimRight(k); StringToUpper(k);
+      if(k != "" && StringFind(u, k) >= 0) return true;
+     }
+   return false;
+  }
+
 // v1.16 : SAV-WS ne passe d'ordres réels que sur les actifs de InpSwTradeList (vide = tous)
 bool SwTradeAllowed(string sym)
   {
@@ -2365,6 +2415,9 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
    if(InpSwMaxPerDay > 0 && SwDayCount() >= InpSwMaxPerDay) return;   // limite du jour atteinte : ordre retiré
    if(InpSwNeedHTFZone && StringFind(g_swConf[slot], "ZoneHTF") < 0) return;   // v1.16 : sans zone HTF, simulation seulement
    if(!SwTradeAllowed(sym)) return;                                            // v1.16 : actif hors liste, simulation seulement
+   if(SwInList(sym, InpSwExclude)) return;                                     // v1.17 : actif exclu (or), simulation seulement
+   if(InpSwMinConfReal > 0 && SwConfCount(g_swConf[slot]) < InpSwMinConfReal) return;   // v1.17 : pas assez de confluences
+   if(InpSwTrendFilter && g_swAlign[slot] != 1) return;                        // v1.17 : contre la tendance de fond (ou inconnue)
 
    bool buy = g_swBuy[slot];
    double e  = RoundPrice(sym, g_swE[slot]);
@@ -2489,6 +2542,7 @@ void SwProcess(bool allowed)
                   g_swBar[slot] = barT;
                   g_swState[slot] = res.state; g_swBuy[slot] = res.buy; g_swE[slot] = res.entry; g_swSL[slot] = res.sl;
                   g_swTP[slot] = res.tp; g_swRR[slot] = res.rr; g_swLvl[slot] = res.lvl; g_swConf[slot] = res.conf;
+                  g_swAlign[slot] = SwTrendAlign(sym, res.buy, TimeCurrent());
                   string jk = GV("swj_" + sym + "_" + SwTfName(tf));
                   if(!GlobalVariableCheck(jk) || (datetime)GlobalVariableGet(jk) != barT)
                     {
@@ -2501,8 +2555,10 @@ void SwProcess(bool allowed)
                         if(nf < 5) continue;
                         if(f[0] == "SETUP" && nf >= 9)
                           {
-                           SavJournal(StringFormat("SAVWS_SETUP;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
-                                                   asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], modeTxt));
+                           int al = SwTrendAlign(sym, f[1] == "BUY", StringToTime(f[2]));
+                           SavJournal(StringFormat("SAVWS_SETUP;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
+                                                   asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], modeTxt,
+                                                   al > 0 ? "TEND" : (al < 0 ? "CONTRE" : "-")));
                            if(SwModeNow() == 1 && InpSwNotify)
                               Notify(StringFormat("SAV-WS %s %s %s (observation) : limite %s, stop %s, objectif %s, %sR | %s",
                                                   SwTfName(tf), sym, f[1] == "BUY" ? "achat" : "vente", f[3], f[4], f[5], f[6], f[8]));
