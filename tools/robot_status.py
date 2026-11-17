@@ -106,6 +106,7 @@ for a in accounts:
 sig, res, days = [], [], []
 ws_setups, ws_res, ws_real = [], [], []
 ws_real_d = []
+plan_tr, plan_open = {}, {}
 seen_bodies = set()
 for c in comments(1):
     if c["body"] in seen_bodies:
@@ -120,6 +121,13 @@ for c in comments(1):
             ws_res.append(dict(code=f[2], tf=f[4], why=f[7], r=float(f[8]), sym=f[3], time=f[6]))
         except ValueError:
             pass
+    if f[0] == "ORACLE_TRADE" and len(f) >= 16 and f[2].startswith("T"):
+        try:
+            plan_tr.setdefault(f[2], []).append(dict(r=float(f[15]), why=f[11], sym=f[4], time=f[9]))
+        except ValueError:
+            pass
+    elif f[0] == "ORACLE_OPEN" and len(f) >= 7 and f[2].startswith("T"):
+        plan_open.setdefault(f[2], f[6])
     elif f[0] == "ORACLE_TRADE" and len(f) >= 16 and f[2].startswith("W"):
         try:
             ws_real.append(float(f[15]))
@@ -183,7 +191,44 @@ try:
             break
 except Exception:
     pass
-out = dict(accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw, crypto_wk=crypto_wk,
+
+# --- idées du plan (T) : émises (historique git des consignes), déclenchées, résultats réels
+def _plan_issued():
+    import subprocess, os
+    seen = {}
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        log = subprocess.run(["git", "-C", root, "log", "--reverse", "--format=@@%cI", "-p", "--", "oracle_signals.csv"],
+                             capture_output=True, text=True, timeout=60).stdout
+        when = ""
+        for ln in log.splitlines():
+            if ln.startswith("@@") and not ln.startswith("@@ "):
+                when = ln[2:18].replace("T", " ")
+            elif ln.startswith("+ORDER;"):
+                f = ln[1:].split(";")
+                if len(f) >= 8 and f[1] not in seen:
+                    seen[f[1]] = dict(id=f[1], sym=f[2], side=f[3], type=f[4], entry=f[5], sl=f[6], tp=f[7], issued=when)
+    except Exception:
+        pass
+    return seen
+_iss = _plan_issued()
+plan_ideas = []
+for k in set(_iss) | set(plan_tr) | set(plan_open):
+    x = dict(_iss.get(k, dict(id=k)))
+    tr = plan_tr.get(k, [])
+    if tr:
+        x["status"] = "clôturée"; x["r"] = round(sum(t["r"] for t in tr) / len(tr), 2)
+    elif k in plan_open:
+        x["status"] = "en cours"
+    else:
+        x["status"] = "non déclenchée"
+    x["opened"] = plan_open.get(k)
+    plan_ideas.append(x)
+plan_ideas.sort(key=lambda x: x.get("issued") or x.get("opened") or "", reverse=True)
+_pr = [x["r"] for x in plan_ideas if "r" in x]
+plan = dict(issued=len(_iss), triggered=sum(1 for x in plan_ideas if x["status"] != "non déclenchée"),
+            real=_stats(_pr), ideas=plan_ideas[:25])
+out = dict(plan=plan, accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw, crypto_wk=crypto_wk,
            sav=dict(mode=None, signals=list(reversed(sig))[:15], results=results),
            days=list(reversed(days))[:10])
 print(json.dumps(out, ensure_ascii=False))
