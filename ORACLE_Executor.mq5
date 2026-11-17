@@ -114,7 +114,7 @@ input ENUM_TIMEFRAMES InpSwTF1  = PERIOD_CURRENT;       // SAV-WS : unité 1 (Ac
 input ENUM_TIMEFRAMES InpSwTF2  = PERIOD_H1;            // SAV-WS : unité 2 (Actuelle = désactivée)
 input string InpTestSwTFs       = "";                   // Testeur : unités SAV-WS testées ensemble, ex. « M15,H1,H4 » (vide = unités 1 et 2)
 input bool   InpSwNeedHTFZone   = true;                 // SAV-WS en réel : zone de l'unité supérieure obligatoire (v1.16 : +0,06 R contre −0,03 R sur 3 ans en H1)
-input string InpSwTradeList     = "BTC,USDCAD";         // SAV-WS en réel : actifs tradés (les autres restent en simulation) ; vide = tous
+input string InpSwTradeList     = "";                   // SAV-WS en réel : actifs tradés, ex. « BTC,USDCAD » (les autres restent en simulation) ; vide = tous (choix du trader le 17/11)
 input ENUM_TIMEFRAMES InpSwHTF  = PERIOD_H4;            // SAV-WS : unité supérieure (tendance, Premium/Discount, zones)
 input bool   InpSwNotify        = false;                // SAV-WS : Telegram / mobile pour chaque setup en observation
 input int    InpSwPivot         = 5;                    // SAV-WS : longueur des pivots
