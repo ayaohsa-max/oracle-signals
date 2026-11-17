@@ -8,6 +8,10 @@ Pour revenir à une version : ouvre le fichier, copie tout le code dans MetaEdit
 
 | Version | Date | Changements | Fichier |
 |---|---|---|---|
+| v1.17 | 17/11/2026 | SAV-WS en réel : tendance de fond obligatoire (moyenne 200 jours), 3 confluences minimum, or exclu ; journal des setups marqué dans/contre la tendance | [code](robot/ORACLE_Executor_v1.17.mq5) |
+| v1.16 | 17/11/2026 | SAV-WS en H1 seul, zone de l'unité supérieure obligatoire en réel, liste d'actifs tradés (tous par défaut) | [code](robot/ORACLE_Executor_v1.16.mq5) |
+| v1.15 | 16/11/2026 | Journal de backtest par actif, indices groupés par bloc dans le plafond d'exposition, crypto le week-end (interrupteur du plan), testeur multi-unités | [code](robot/ORACLE_Executor_v1.15.mq5) |
+| v1.14 | 15/11/2026 | Exposition par devise, 3 trades SAV-WS par jour, pause calendrier MT5, alerte de nouvelle version | [code](robot/ORACLE_Executor_v1.14.mq5) |
 | v1.13 | 15/11/2026 | Journal des exécutions et positions dans le signal de vie, alerte consignes > 10 h, perte du jour 2,5 %, anti-doublon, mode testeur MT5 | [code](robot/ORACLE_Executor_v1.13.mq5) |
 | v1.12 | 15/11/2026 | Alertes d'observation SAV-WS coupées par défaut, 5 idées max par défaut | [code](robot/ORACLE_Executor_v1.12.mq5) |
 | v1.11 | 13/11/2026 | SAV-WS : mesure et option du passage au prix d'entrée ; consignes sans cache GitHub | [code](robot/ORACLE_Executor_v1.11.mq5) |
@@ -27,6 +31,7 @@ Les versions 1.00 et 1.01 n'ont pas été publiées dans le dépôt.
 
 | Version | Date | Changements | Fichier |
 |---|---|---|---|
+| v1.1 | 17/11/2026 | Aligné sur le robot v1.17 : zone de l'unité supérieure obligatoire, 3 confluences minimum, tendance de fond D1 (moyenne 200 jours) | [code](indicateur/SAV-WS_v1.1.pine) |
 | v1.0 | 13/11/2026 | Filtres SAV-AFS + entrée WinStructure (Fibo 0,618 à 1, confluences, 2 confluences minimum) | [code](indicateur/SAV-WS_v1.0.pine) |
 
 ## Règle
