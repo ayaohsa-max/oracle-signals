@@ -44,7 +44,8 @@ for c in comments(2):
     key = (f[1], f[3])
     beats[key] = dict(login=f[1], type=f[2], server=f[3], version=f[4], last=f[5], state=f[6],
                       consignes=f[7], ideas=f[8], equity=f[9], ccy=f[10], created=c["created_at"],
-                      positions=(f[11] if len(f) > 11 else ""), pending=(f[12] if len(f) > 12 else ""))
+                      positions=(f[11] if len(f) > 11 else ""), pending=(f[12] if len(f) > 12 else ""),
+                      settings=(dict(kv.split("=", 1) for kv in f[13].split(",") if "=" in kv) if len(f) > 13 else {}))
 accounts = []
 by_login = collections.defaultdict(list)
 for b in beats.values():
@@ -67,9 +68,9 @@ for b in beats.values():
     accounts.append(b)
 for a in accounts:
     if a["flag"] == "alerte":
-        alerts.append(f"Compte {a['login']} ({a['type']}) : {a['state']}")
+        alerts.append(f"Compte •••{a['login'][-3:]} ({a['type']}) : {a['state']}")
     elif a["flag"] == "silence":
-        alerts.append(f"Compte {a['login']} : aucun signal de vie depuis {a['age_min']} min (PC, réseau ou MT5 coupé ?)")
+        alerts.append(f"Compte •••{a['login'][-3:]} : aucun signal de vie depuis {a['age_min']} min (PC, réseau ou MT5 coupé ?)")
 # deux robots sur le meme compte : plus de signaux de vie que prevu sur les 3 dernieres heures (1 par heure attendu)
 cnt = collections.Counter()
 for c in comments(2)[-300:]:
@@ -80,10 +81,26 @@ for c in comments(2)[-300:]:
             cnt[f[1]] += 1
 for login, k in cnt.items():
     if k >= 5:
-        alerts.append(f"Compte {login} : deux robots semblent tourner sur le même compte (à retirer d'un des deux MetaTrader)")
+        alerts.append(f"Compte •••{login[-3:]} : deux robots semblent tourner sur le même compte (à retirer d'un des deux MetaTrader)")
+# v1.19 : contrôle des réglages clés envoyés par le robot (profil validé le 17/11)
+EXPECT = dict(idees="6", swUnites="H1", swConfReel="3", swZone="oui", swTendance="oui")
+for a in accounts:
+    s_ = a.get("settings") or {}
+    if not s_:
+        continue
+    bad = [f"{k} = {s_.get(k, '?')} (attendu {v})" for k, v in EXPECT.items() if s_.get(k) != v]
+    try:
+        if float(s_.get("risqueTotal", "0")) > 2.1 or float(s_.get("perteJour", "0")) > 2.5:
+            bad.append(f"risque total {s_.get('risqueTotal')} % / perte du jour {s_.get('perteJour')} % (max 2,1 / 2,5)")
+    except ValueError:
+        pass
+    a["settings_ok"] = not bad
+    if bad:
+        alerts.append("Réglages du robot à corriger : " + " ; ".join(bad))
 accounts.sort(key=lambda x: x["age_min"])
 for a in accounts:
     a.pop("created", None)
+    a["login"] = "•••" + a["login"][-3:]   # numéro de compte masqué (page publique)
 
 # --- journal
 sig, res, days = [], [], []
@@ -119,7 +136,7 @@ for c in comments(1):
             pass
     elif f[0] == "ORACLE_DAY" and len(f) >= 8:
         d = f[2]
-        days.append(dict(login=f[1], date=f"{d[6:8]}/{d[4:6]}/{d[0:4]}", balance=f[3], equity=f[4], peak=f[5], pnl=f[6], ccy=f[7]))
+        days.append(dict(login="•••" + f[1][-3:], date=f"{d[6:8]}/{d[4:6]}/{d[0:4]}", balance=f[3], equity=f[4], peak=f[5], pnl=f[6], ccy=f[7]))
 n = len(res)
 results = dict(n=n, win=(f"{100*sum(1 for r in res if r > 0)/n:.0f} %" if n else None),
                exp=(round(sum(res) / n, 2) if n else None))
