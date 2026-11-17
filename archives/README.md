@@ -8,7 +8,7 @@ Pour revenir à une version : ouvre le fichier, copie tout le code dans MetaEdit
 
 | Version | Date | Changements | Fichier |
 |---|---|---|---|
-| v1.19 | 17/11/2026 | Mesures SAV-WS pour l'optimisation : régime de marché du setup (ADX journalier, distance à la moyenne 200 jours en ATR, volatilité) et gain maximal atteint en R | [code](robot/ORACLE_Executor_v1.19.mq5) |
+| v1.19 | 17/11/2026 | Réglages clés dans le signal de vie (contrôle à distance), 6 idées et risque total 2,1 % par défaut ; mesures SAV-WS pour l'optimisation : régime de marché du setup (ADX journalier, distance à la moyenne 200 jours en ATR, volatilité) et gain maximal atteint en R | [code](robot/ORACLE_Executor_v1.19.mq5) |
 | v1.18 | 17/11/2026 | Délai d'entrée SAV-WS (bougies entre le setup et l'exécution) noté dans le journal, pour choisir la meilleure durée de validité | [code](robot/ORACLE_Executor_v1.18.mq5) |
 | v1.17 | 17/11/2026 | SAV-WS en réel : tendance de fond obligatoire (moyenne 200 jours), 3 confluences minimum, or exclu ; journal des setups marqué dans/contre la tendance | [code](robot/ORACLE_Executor_v1.17.mq5) |
 | v1.16 | 17/11/2026 | SAV-WS en H1 seul, zone de l'unité supérieure obligatoire en réel, liste d'actifs tradés (tous par défaut) | [code](robot/ORACLE_Executor_v1.16.mq5) |

@@ -59,7 +59,7 @@ input double InpMaxRiskPct      = 1.0;                  // Plafond absolu du ris
 input double InpMaxDailyLossPct = 2.5;                  // Perte max du jour en % (coupe tout jusqu'au lendemain)
 input double InpMaxTotalLossPct = 8.0;                  // Perte max totale en % (arrêt définitif)
 input bool   InpTrailingMaxLoss = true;                 // Perte max totale mesurée depuis le plus haut de l'équité (règle FTMO « trailing »)
-input int    InpMaxTrades       = 5;                    // Nombre max d'idées ouvertes ou en attente
+input int    InpMaxTrades       = 6;                    // Nombre max d'idées ouvertes ou en attente
 input double InpMaxSignalAgeH   = 36;                   // Consignes plus vieilles = on annule les ordres en attente
 input bool   InpAlertStale      = true;                 // Alerte Telegram si consignes trop anciennes / illisibles (en semaine)
 input int    InpMaxPerCcySide   = 2;                    // Exposition : trades max dans le même sens sur une même devise (0 = sans limite)
@@ -99,7 +99,7 @@ input int    InpGitIssue        = 1;                    // GitHub : numéro du t
 input int    InpBeatIssue       = 2;                    // GitHub : numéro du ticket « Signal de vie » (0 = désactivé)
 input int    InpBeatMinutes     = 60;                   // Signal de vie toutes les N minutes
 input double InpMaxSpreadPct    = 10.0;                 // Spread max, en % de la distance entrée-stop (sinon on attend)
-input double InpMaxOpenRiskPct  = 1.5;                  // Risque total max (positions + ordres en attente), en % du capital
+input double InpMaxOpenRiskPct  = 2.1;                  // Risque total max (positions + ordres en attente), en % du capital
 input int    InpLossStreak      = 3;                    // Après N idées perdantes d'affilée...
 input double InpStreakFactor    = 0.5;                  // ...le risque par trade est multiplié par ce facteur
 input double InpTrailATRMult    = 1.0;                  // Sortie « ATR » : stop suiveur à N x ATR(14) journalier sur la 2e moitié
@@ -2764,6 +2764,21 @@ void StaleAlert(bool ok, bool stale, int wk)
 
 // Signal de vie : un commentaire dans le ticket GitHub InpBeatIssue toutes les InpBeatMinutes minutes.
 // HEARTBEAT;compte;DÉMO|RÉEL;serveur;version;heure UTC;état;consignes du;idées;équité;devise;positions (ID:symbole:sens:résultat, ou -);ordres en attente
+// v1.19 : réglages clés du robot, envoyés dans le signal de vie (séparés par des virgules, sans point-virgule)
+string SettingsLine()
+  {
+   string tfs = "";
+   for(int i = 0; i < ArraySize(g_swTFs); i++) tfs += (i > 0 ? "+" : "") + SwTfName(g_swTFs[i]);
+   if(tfs == "") tfs = "aucune";
+   string ex = InpSwExclude, li = InpSwTradeList;
+   StringReplace(ex, ",", "+"); StringReplace(li, ",", "+");
+   return StringFormat("idees=%d,risqueTotal=%.2f,perteJour=%.2f,swUnites=%s,swConfReel=%d,swZone=%s,swTendance=%s,swExclus=%s,swListe=%s,cryptoWE=%s,validite=%d",
+                       InpMaxTrades, InpMaxOpenRiskPct, InpMaxDailyLossPct, tfs, InpSwMinConfReal,
+                       InpSwNeedHTFZone ? "oui" : "non", InpSwTrendFilter ? "oui" : "non",
+                       ex == "" ? "-" : ex, li == "" ? "tous" : li,
+                       (InpCryptoWeekend && g_cwMode == 1) ? "actif" : "arret", InpSwMaxWait);
+  }
+
 void Heartbeat()
   {
    if(g_tester) return;
@@ -2794,7 +2809,8 @@ void Heartbeat()
                               AccountInfoString(ACCOUNT_SERVER),
                               TimeToString(TimeGMT(), TIME_DATE | TIME_MINUTES), g_state,
                               g_updated > 0 ? TimeToString(g_updated, TIME_DATE | TIME_MINUTES) : "jamais",
-                              CountActiveIds(), AccountInfoDouble(ACCOUNT_EQUITY), AccountInfoString(ACCOUNT_CURRENCY), pos, pend);
+                              CountActiveIds(), AccountInfoDouble(ACCOUNT_EQUITY), AccountInfoString(ACCOUNT_CURRENCY), pos, pend)
+                 + ";" + SettingsLine();   // v1.19 : 14e champ = réglages clés (contrôle à distance)
    if(!GitSend(line, InpBeatIssue)) g_lastBeat = TimeLocal() - MathMax(15, InpBeatMinutes) * 60 + 300;   // échec : réessai dans 5 min
   }
 
