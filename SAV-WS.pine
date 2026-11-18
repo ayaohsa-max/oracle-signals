@@ -4,7 +4,7 @@
 //          + entrée WinStructure (structure, Fibo, confluences)
 // Unités de temps : 5 min à 1 jour (profil ORACLE v1.20 : H1, UT supérieure H4, zone HTF obligatoire,
 //   3 confluences minimum, tendance de fond D1 vs moyenne 200 jours, objectif plafonné à 3 R,
-//   volatilité journalière ATR14/ATR100 entre 0,8 et 2,0 ; or à éviter)
+//   volatilité journalière ATR14/ATR100 entre 0,8 et 2,0 ; or réintégré le 18/11)
 // Version 1.2 (18/11/2026), alignée sur le robot ORACLE_Executor v1.20
 // Fibo : 0 = extrême de l'impulsion, 1 = origine de l'impulsion
 // Entrée : 0.618 / 0.705 / 0.786 / 0.893 / 1 si confluences

@@ -117,7 +117,7 @@ input bool   InpSwNeedHTFZone   = true;                 // SAV-WS en réel : zon
 input bool   InpSwTrendFilter   = true;                 // SAV-WS en réel : sens de la tendance de fond obligatoire (v1.17 : prix contre moyenne 200 jours)
 input int    InpSwTrendMA       = 200;                  // SAV-WS : période de la moyenne de tendance (journalier)
 input int    InpSwMinConfReal   = 3;                    // SAV-WS en réel : confluences minimum (v1.17 ; la détection garde InpSwMinConf)
-input string InpSwExclude       = "XAU";                // SAV-WS en réel : actifs exclus (v1.17 : l'or perd dans toutes les unités) ; vide = aucun
+input string InpSwExclude       = "";                   // SAV-WS en réel : actifs exclus ; vide = aucun (v1.20 : or réintégré à la demande du trader le 18/11)
 input double InpSwMaxTPR        = 3.0;                  // SAV-WS en réel : objectif plafonné à n R (v1.20, backtest 8 ans : 9 années gagnantes sur 9) ; 0 = objectif du setup
 input double InpSwVolMin        = 0.8;                  // SAV-WS en réel : volatilité minimale ATR14/ATR100 journalier (v1.20) ; 0 = pas de filtre
 input double InpSwVolMax        = 2.0;                  // SAV-WS en réel : volatilité maximale ATR14/ATR100 journalier (v1.20) ; 0 = pas de filtre
