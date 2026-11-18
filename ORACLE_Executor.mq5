@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.19"
-#define ORACLE_VERSION "1.19"
+#property version   "1.20"
+#define ORACLE_VERSION "1.20"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -118,6 +118,9 @@ input bool   InpSwTrendFilter   = true;                 // SAV-WS en réel : sen
 input int    InpSwTrendMA       = 200;                  // SAV-WS : période de la moyenne de tendance (journalier)
 input int    InpSwMinConfReal   = 3;                    // SAV-WS en réel : confluences minimum (v1.17 ; la détection garde InpSwMinConf)
 input string InpSwExclude       = "XAU";                // SAV-WS en réel : actifs exclus (v1.17 : l'or perd dans toutes les unités) ; vide = aucun
+input double InpSwMaxTPR        = 3.0;                  // SAV-WS en réel : objectif plafonné à n R (v1.20, backtest 8 ans : 9 années gagnantes sur 9) ; 0 = objectif du setup
+input double InpSwVolMin        = 0.8;                  // SAV-WS en réel : volatilité minimale ATR14/ATR100 journalier (v1.20) ; 0 = pas de filtre
+input double InpSwVolMax        = 2.0;                  // SAV-WS en réel : volatilité maximale ATR14/ATR100 journalier (v1.20) ; 0 = pas de filtre
 input string InpSwTradeList     = "";                   // SAV-WS en réel : actifs tradés, ex. « BTC,USDCAD » (les autres restent en simulation) ; vide = tous (choix du trader le 17/11)
 input ENUM_TIMEFRAMES InpSwHTF  = PERIOD_H4;            // SAV-WS : unité supérieure (tendance, Premium/Discount, zones)
 input bool   InpSwNotify        = false;                // SAV-WS : Telegram / mobile pour chaque setup en observation
@@ -2445,6 +2448,34 @@ bool SwTradeAllowed(string sym)
    return false;
   }
 
+// v1.20 : volatilité du jour (ATR14 / ATR100 journalier), calculée une fois par actif et par jour
+string g_volSym[]; datetime g_volDay[]; double g_volVal[];
+double SwVolNow(string sym)
+  {
+   datetime day = iTime(sym, PERIOD_D1, 0);
+   int n = ArraySize(g_volSym);
+   for(int i = 0; i < n; i++)
+      if(g_volSym[i] == sym && g_volDay[i] == day) return g_volVal[i];
+   string r[];
+   double v = -1;
+   if(StringSplit(SwRegime(sym, TimeCurrent()), ';', r) == 3 && r[2] != "-") v = StringToDouble(r[2]);
+   for(int i = 0; i < n; i++)
+      if(g_volSym[i] == sym) { g_volDay[i] = day; g_volVal[i] = v; return v; }
+   ArrayResize(g_volSym, n + 1); ArrayResize(g_volDay, n + 1); ArrayResize(g_volVal, n + 1);
+   g_volSym[n] = sym; g_volDay[n] = day; g_volVal[n] = v;
+   return v;
+  }
+
+bool SwVolOK(string sym)
+  {
+   if(InpSwVolMin <= 0 && InpSwVolMax <= 0) return true;
+   double v = SwVolNow(sym);
+   if(v <= 0) return false;                       // volatilité inconnue : pas d'ordre réel
+   if(InpSwVolMin > 0 && v < InpSwVolMin) return false;
+   if(InpSwVolMax > 0 && v > InpSwVolMax) return false;
+   return true;
+  }
+
 void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, int &keep[])
   {
    ulong pt = 0;
@@ -2471,6 +2502,7 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
    if(SwInList(sym, InpSwExclude)) return;                                     // v1.17 : actif exclu (or), simulation seulement
    if(InpSwMinConfReal > 0 && SwConfCount(g_swConf[slot]) < InpSwMinConfReal) return;   // v1.17 : pas assez de confluences
    if(InpSwTrendFilter && g_swAlign[slot] != 1) return;                        // v1.17 : contre la tendance de fond (ou inconnue)
+   if(!SwVolOK(sym)) return;                                                   // v1.20 : volatilité hors zone 0,8-2,0
 
    bool buy = g_swBuy[slot];
    double e  = RoundPrice(sym, g_swE[slot]);
@@ -2498,6 +2530,11 @@ void SwSync(string sym, ENUM_TIMEFRAMES tf, int idnum, int slot, bool allowed, i
    if(buy ? (ask <= e + gap) : (bid >= e - gap)) return; // le prix est déjà sur l'entrée : pas d'ordre limite possible
    double dist = MathAbs(e - sl);
    if(dist <= 0) return;
+   if(InpSwMaxTPR > 0)                                                        // v1.20 : objectif plafonné à n R
+     {
+      double cap = RoundPrice(sym, buy ? e + InpSwMaxTPR * dist : e - InpSwMaxTPR * dist);
+      if(buy ? (tp > cap) : (tp < cap)) tp = cap;
+     }
    if(InpMaxSpreadPct > 0 && (ask - bid) > dist * InpMaxSpreadPct / 100.0) return;
 
    double riskPct = MathMin((InpRiskOverride > 0) ? InpRiskOverride : g_risk, InpMaxRiskPct);
@@ -2772,11 +2809,11 @@ string SettingsLine()
    if(tfs == "") tfs = "aucune";
    string ex = InpSwExclude, li = InpSwTradeList;
    StringReplace(ex, ",", "+"); StringReplace(li, ",", "+");
-   return StringFormat("idees=%d,risqueTotal=%.2f,perteJour=%.2f,swUnites=%s,swConfReel=%d,swZone=%s,swTendance=%s,swExclus=%s,swListe=%s,cryptoWE=%s,validite=%d",
+   return StringFormat("idees=%d,risqueTotal=%.2f,perteJour=%.2f,swUnites=%s,swConfReel=%d,swZone=%s,swTendance=%s,swExclus=%s,swListe=%s,cryptoWE=%s,validite=%d,swObjMax=%.1f,swVol=%.1f-%.1f",
                        InpMaxTrades, InpMaxOpenRiskPct, InpMaxDailyLossPct, tfs, InpSwMinConfReal,
                        InpSwNeedHTFZone ? "oui" : "non", InpSwTrendFilter ? "oui" : "non",
                        ex == "" ? "-" : ex, li == "" ? "tous" : li,
-                       (InpCryptoWeekend && g_cwMode == 1) ? "actif" : "arret", InpSwMaxWait);
+                       (InpCryptoWeekend && g_cwMode == 1) ? "actif" : "arret", InpSwMaxWait, InpSwMaxTPR, InpSwVolMin, InpSwVolMax);
   }
 
 void Heartbeat()

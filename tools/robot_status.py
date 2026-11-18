@@ -92,6 +92,8 @@ for a in accounts:
     if not s_:
         continue
     bad = [f"{k} = {s_.get(k, '?')} (attendu {v})" for k, v in EXPECT.items() if s_.get(k) != v]
+    # v1.20 : objectif plafonné à 3 R et filtre de volatilité 0,8-2,0 (contrôlés seulement s'ils sont transmis)
+    bad += [f"{k} = {s_[k]} (attendu {v})" for k, v in dict(swObjMax="3.0", swVol="0.8-2.0").items() if k in s_ and s_[k] != v]
     try:
         if float(s_.get("risqueTotal", "0")) > 2.1 or float(s_.get("perteJour", "0")) > 2.5:
             bad.append(f"risque total {s_.get('risqueTotal')} % / perte du jour {s_.get('perteJour')} % (max 2,1 / 2,5)")

@@ -9,6 +9,7 @@ Pour revenir à une version : ouvre le fichier, copie tout le code dans MetaEdit
 | Version | Date | Changements | Fichier |
 |---|---|---|---|
 | v1.19 | 17/11/2026 | Réglages clés dans le signal de vie (contrôle à distance), 6 idées et risque total 2,1 % par défaut ; mesures SAV-WS pour l'optimisation : régime de marché du setup (ADX journalier, distance à la moyenne 200 jours en ATR, volatilité) et gain maximal atteint en R | [code](robot/ORACLE_Executor_v1.19.mq5) |
+| v1.20 | 18/11/2026 | SAV-WS en réel : objectif plafonné à 3 R et filtre de volatilité journalière (ATR14/ATR100 entre 0,8 et 2,0), retenus par le backtest 8 ans H1 (19 actifs) : +0,19 R puis +0,10 R par trade sur la période de contrôle 2024-2026, 9 années gagnantes sur 9 | [code](robot/ORACLE_Executor_v1.20.mq5) |
 | v1.18 | 17/11/2026 | Délai d'entrée SAV-WS (bougies entre le setup et l'exécution) noté dans le journal, pour choisir la meilleure durée de validité | [code](robot/ORACLE_Executor_v1.18.mq5) |
 | v1.17 | 17/11/2026 | SAV-WS en réel : tendance de fond obligatoire (moyenne 200 jours), 3 confluences minimum, or exclu ; journal des setups marqué dans/contre la tendance | [code](robot/ORACLE_Executor_v1.17.mq5) |
 | v1.16 | 17/11/2026 | SAV-WS en H1 seul, zone de l'unité supérieure obligatoire en réel, liste d'actifs tradés (tous par défaut) | [code](robot/ORACLE_Executor_v1.16.mq5) |
@@ -34,6 +35,7 @@ Les versions 1.00 et 1.01 n'ont pas été publiées dans le dépôt.
 | Version | Date | Changements | Fichier |
 |---|---|---|---|
 | v1.1 | 17/11/2026 | Aligné sur le robot v1.17 : zone de l'unité supérieure obligatoire, 3 confluences minimum, tendance de fond D1 (moyenne 200 jours) | [code](indicateur/SAV-WS_v1.1.pine) |
+| v1.2 | 18/11/2026 | Aligné sur le robot v1.20 : objectif plafonné à 3 R, filtre de volatilité journalière 0,8-2,0 | [code](indicateur/SAV-WS_v1.2.pine) |
 | v1.0 | 13/11/2026 | Filtres SAV-AFS + entrée WinStructure (Fibo 0,618 à 1, confluences, 2 confluences minimum) | [code](indicateur/SAV-WS_v1.0.pine) |
 
 ## Règle
