@@ -112,12 +112,29 @@ sig, res, days = [], [], []
 ws_setups, ws_res, ws_real = [], [], []
 ws_real_d = []
 plan_tr, plan_open = {}, {}
+events = []                            # v1.21 : historique prises / sorties / annulations pour la page
 seen_bodies = set()
 for c in comments(1):
     if c["body"] in seen_bodies:
         continue                       # ligne en double dans le journal
     seen_bodies.add(c["body"])
     f = c["body"].split(";")
+    try:
+        if f[0] == "ORACLE_OPEN" and len(f) >= 10:
+            events.append(dict(kind="prise", id=f[2], leg=f[3], sym=f[4], side=f[5], time=f[6], price=f[7], sl=f[8], tp=f[9]))
+        elif f[0] == "ORACLE_TRADE" and len(f) >= 16:
+            w = f[11].replace("clôture", "cloture")
+            r = float(f[15])
+            if w == "stop" and abs(r) < 0.15:
+                w = "stop_entree"
+            elif w == "stop" and r > 0:
+                w = "stop_gain"
+            events.append(dict(kind="sortie", id=f[2], leg=f[3], sym=f[4], side=f[5], time=f[9], price=f[10],
+                               why=w, pnl=float(f[13]), ccy=f[14], r=r))
+        elif f[0] == "ORACLE_CANCEL" and len(f) >= 6:
+            events.append(dict(kind="annule", id=f[2], sym=f[3], why=f[4], time=f[5].replace("T", " ")))
+    except ValueError:
+        pass
     if f[0] == "SAVWS_SETUP" and len(f) >= 14:
         ws_setups.append(dict(code=f[2], tf=f[4], side="Achat" if f[5] == "BUY" else "Vente", time=f[6],
                               entry=f[7], sl=f[8], tp=f[9], rr=f[10], conf=f[12], mode=f[13]))
@@ -233,7 +250,8 @@ plan_ideas.sort(key=lambda x: x.get("issued") or x.get("opened") or "", reverse=
 _pr = [x["r"] for x in plan_ideas if "r" in x]
 plan = dict(issued=len(_iss), triggered=sum(1 for x in plan_ideas if x["status"] != "non déclenchée"),
             real=_stats(_pr), ideas=plan_ideas[:25])
-out = dict(plan=plan, accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw, crypto_wk=crypto_wk,
+events.sort(key=lambda e: e.get("time") or "", reverse=True)
+out = dict(events=events[:40], plan=plan, accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw, crypto_wk=crypto_wk,
            sav=dict(mode=None, signals=list(reversed(sig))[:15], results=results),
            days=list(reversed(days))[:10])
 print(json.dumps(out, ensure_ascii=False))

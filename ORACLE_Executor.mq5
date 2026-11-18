@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.20"
-#define ORACLE_VERSION "1.20"
+#property version   "1.21"
+#define ORACLE_VERSION "1.21"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -660,6 +660,30 @@ int CountActiveIds()
   }
 
 bool WasFilled(int idnum) { return GlobalVariableCheck(GV("filled_" + IntegerToString(idnum))); }
+// v1.21 : motif des fermetures faites par le robot (gardé par position jusqu'au journal) et journal des ordres annulés
+void MarkClose(ulong posTicket, int code) { GlobalVariableSet(GV("cw_" + IntegerToString((long)posTicket)), code); }
+string CloseWhy(long reason, long posId)
+  {
+   if(reason == DEAL_REASON_SL) return "stop";
+   if(reason == DEAL_REASON_TP) return "objectif";
+   if(reason == DEAL_REASON_SO) return "stop_out";
+   if(reason == DEAL_REASON_CLIENT || reason == DEAL_REASON_MOBILE || reason == DEAL_REASON_WEB) return "manuel";
+   string k = GV("cw_" + IntegerToString(posId));
+   if(GlobalVariableCheck(k))
+     {
+      int c = (int)GlobalVariableGet(k);
+      GlobalVariableDel(k);
+      return c == 1 ? "coupure_risque" : c == 2 ? "vendredi" : c == 3 ? "rattrapage_vendredi" : "robot";
+     }
+   return reason == DEAL_REASON_EXPERT ? "robot" : "cloture";
+  }
+void JournalCancel(int idnum, string sym, string why)
+  {
+   string l = StringFormat("ORACLE_CANCEL;%I64d;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN), NumToId(idnum), sym, why,
+                           TimeToString(TimeTradeServer(), TIME_DATE | TIME_MINUTES));   // heure du serveur, comme ORACLE_OPEN
+   JournalLocal(l);
+   GitQueue(l);
+  }
 
 void DeletePending(string why, int onlyId = -1)
   {
@@ -670,8 +694,12 @@ void DeletePending(string why, int onlyId = -1)
       long m = OrderGetInteger(ORDER_MAGIC);
       if(!IsOurs(m)) continue;
       if(onlyId >= 0 && MagicId(m) != onlyId) continue;
+      string osym = OrderGetString(ORDER_SYMBOL);
       if(g_trade.OrderDelete(t))
+        {
          Print("ORACLE : ordre ", NumToId(MagicId(m)), " annulé (", why, ")");
+         JournalCancel(MagicId(m), osym, why);
+        }
      }
   }
 
@@ -683,6 +711,7 @@ void CloseAll(string why)
       ulong t = PositionGetTicket(i);
       if(t == 0) continue;
       if(!IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
+      MarkClose(t, 1);
       g_trade.PositionClose(t);
      }
    Notify("tout est fermé : " + why);
@@ -1178,9 +1207,11 @@ void ManagePending(bool allowed, string why)
                reason = "niveaux modifiés dans le plan";
            }
         }
+      string osym2 = OrderGetString(ORDER_SYMBOL);
       if(reason != "" && g_trade.OrderDelete(t))
         {
          Print("ORACLE : ordre ", NumToId(idnum), " annulé (", reason, ")");
+         JournalCancel(idnum, osym2, reason);
          if(reason == "idée retirée du plan" || reason == "niveaux modifiés dans le plan")
             Notify(NumToId(idnum) + " : ordre en attente annulé (" + reason + ")");
         }
@@ -1670,6 +1701,7 @@ void FridayClose()
       if(t == 0 || !IsOurs(PositionGetInteger(POSITION_MAGIC))) continue;
       if(InpCryptoWeekend && g_cwMode == 1 && IsCrypto(PositionGetString(POSITION_SYMBOL))) continue;   // crypto : gardée le week-end (v1.15)
       open++;
+      MarkClose(t, 2);
       if(g_trade.PositionClose(t)) closed++;
      }
    MqlDateTime p;
@@ -2681,8 +2713,12 @@ void SwProcess(bool allowed)
       if(!SwIsSw(id)) continue;
       bool kept = false;
       for(int j = 0; j < ArraySize(keep); j++) if(keep[j] == id) kept = true;
+      string wsym = OrderGetString(ORDER_SYMBOL);
       if(!kept && g_trade.OrderDelete(tk))
+        {
          Print("ORACLE : ordre ", NumToId(id), " SAV-WS annulé (setup terminé, invalidé ou robot en pause).");
+         JournalCancel(id, wsym, "setup SAV-WS terminé ou invalidé");
+        }
      }
   }
 
@@ -2754,6 +2790,7 @@ void WeekendCatchUp()
       datetime openUtc = (datetime)PositionGetInteger(POSITION_TIME) - srvOff;
       if(openUtc >= cutUtc) continue;
       n++;
+      MarkClose(t, 3);
       if(g_trade.PositionClose(t)) ok++;
      }
    if(n == 0 || ok == 0) return;
@@ -3011,7 +3048,7 @@ void JournalTrade(ulong outDeal)
    double vol = HistoryDealGetDouble(outDeal, DEAL_VOLUME);
    double pnl = HistoryDealGetDouble(outDeal, DEAL_PROFIT) + HistoryDealGetDouble(outDeal, DEAL_SWAP) + HistoryDealGetDouble(outDeal, DEAL_COMMISSION);
    long r = HistoryDealGetInteger(outDeal, DEAL_REASON);
-   string why = (r == DEAL_REASON_SL) ? "stop" : (r == DEAL_REASON_TP) ? "objectif" : "cloture";
+   string why = CloseWhy(r, posId);                                  // v1.21 : manuel, coupure, vendredi…
 
    double entry = 0, sl0 = 0;
    datetime tIn = 0;
@@ -3092,7 +3129,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest 
      {
       double pnl = HistoryDealGetDouble(trans.deal, DEAL_PROFIT) + HistoryDealGetDouble(trans.deal, DEAL_SWAP) + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
       long r = HistoryDealGetInteger(trans.deal, DEAL_REASON);
-      string why = (r == DEAL_REASON_SL) ? "stop" : (r == DEAL_REASON_TP) ? "objectif" : "clôture";
+      string why = (r == DEAL_REASON_SL) ? "stop" : (r == DEAL_REASON_TP) ? "objectif" :
+                   (r == DEAL_REASON_CLIENT || r == DEAL_REASON_MOBILE || r == DEAL_REASON_WEB) ? "fermeture manuelle" : "clôture";
       Notify(StringFormat("%s %s fermé (%s) à %s, résultat %.2f %s", id, sym, why, DoubleToString(price, d), pnl, AccountInfoString(ACCOUNT_CURRENCY)));
       JournalTrade(trans.deal);
      }
