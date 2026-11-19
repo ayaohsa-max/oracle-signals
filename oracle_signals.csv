@@ -1,5 +1,5 @@
 # ORACLE – consignes pour ORACLE_Executor, générées automatiquement depuis le plan (ne pas modifier à la main)
-HEADER;2026.11.19 14:48;1;0.35;0;1;2;0
+HEADER;2026.11.19 18:49;1;0.35;0;1;2;0
 ORDER;T11;EURGBP;SELL;STOP;0.829;0.8345;0.818;0.815;0
 ORDER;T14;USDCAD;BUY;LIMIT;1.43;1.4225;1.445;1.4525;0
 BIAS;EURUSD;-1
