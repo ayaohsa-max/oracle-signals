@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.21"
-#define ORACLE_VERSION "1.21"
+#property version   "1.22"
+#define ORACLE_VERSION "1.22"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -1733,6 +1733,41 @@ void FridayClose()
 //| Le calcul est rejoué sur l'historique récent à chaque bougie     |
 //| clôturée : aucun état perdu au redémarrage.                      |
 //+------------------------------------------------------------------+
+//| v1.22 : variantes de sortie mesurées en simulation (testeur et   |
+//| suivi), sans effet sur les ordres réels :                        |
+//| 0 = objectif plafonné (v1.20) ; 1 = 50 % à 1,5 R puis stop à      |
+//| l'entrée ; 2 = suivi ATR (2 ATR sous le plus haut dès +1 R) ;     |
+//| 3 = suivi de structure (plus bas des 5 bougies dès +1 R).         |
+//| Bougie ambiguë : le stop est supposé touché en premier.           |
+//+------------------------------------------------------------------+
+void SwVarStep(bool buy, const MqlRates &bar, bool fillBar, double entry, double risk, double tp3, double atrv, double struct5,
+               int v, double &stp[], double &ext[], double &res[], bool &part[], bool &done[])
+  {
+   if(done[v] || risk <= 0) return;
+   bool hitS = buy ? (bar.low <= stp[v]) : (bar.high >= stp[v]);
+   if(hitS)
+     {
+      double rr = (buy ? stp[v] - entry : entry - stp[v]) / risk;
+      res[v] = part[v] ? 0.75 + 0.5 * rr : rr;
+      done[v] = true;
+      return;
+     }
+   if(!fillBar && (buy ? bar.high >= tp3 : bar.low <= tp3))
+     {
+      double rr = MathAbs(tp3 - entry) / risk;
+      res[v] = part[v] ? 0.75 + 0.5 * rr : rr;
+      done[v] = true;
+      return;
+     }
+   ext[v] = buy ? MathMax(ext[v], bar.high) : MathMin(ext[v], bar.low);
+   double fav = (buy ? ext[v] - entry : entry - ext[v]) / risk;
+   if(fillBar) return;
+   if(v == 1 && !part[v] && fav >= 1.5) { part[v] = true; stp[v] = buy ? MathMax(stp[v], entry) : MathMin(stp[v], entry); }
+   if(v == 2 && fav >= 1.0) { double ns = buy ? ext[v] - 2.0 * atrv : ext[v] + 2.0 * atrv; stp[v] = buy ? MathMax(stp[v], ns) : MathMin(stp[v], ns); }
+   if(v == 3 && fav >= 1.0) stp[v] = buy ? MathMax(stp[v], struct5) : MathMin(stp[v], struct5);
+  }
+
+//+------------------------------------------------------------------+
 struct SwRes
   {
    int               state;    // dernière bougie clôturée : 0 rien, 1 ordre limite valide, 2 en position
@@ -2086,6 +2121,8 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
    bool bBeOn = false, bBeOut = false;
    int  bBeBar = -1;
    double bMfe = 0;   // v1.19 : gain maximal atteint en R
+   double bvS[4], bvE[4], bvR[4]; bool bvP[4], bvD[4];   // v1.22 : variantes de sortie (achat)
+   double svS[4], svE[4], svR[4]; bool svP[4], svD[4];   // v1.22 : variantes de sortie (vente)
    // vente
    int sState = 0, sOIdx = -1, sStart = -1, sFill = -1;
    double sO = 0, sExt = 0, sEntry = 0, sEL = 0, sSL = 0, sTP = 0, sRR = 0;
@@ -2184,6 +2221,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
          if(bValid && r[t].low <= bEntry)
            {
             bState = 2; bFill = t; bBeOn = false; bBeOut = false; bBeBar = -1; bMfe = 0;
+            for(int v = 0; v < 4; v++) { bvS[v] = bSL; bvE[v] = bEntry; bvR[v] = 0; bvP[v] = false; bvD[v] = false; }
             if(t == last) Print("ORACLE : SAV-WS ", sym, " ", SwTfName(tf), " achat déclenché à ", DoubleToString(bEntry, dg));
            }
          else if(r[t].high > bExt) { bExt = r[t].high; bEval = true; }
@@ -2221,6 +2259,13 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
          // variante « passage à l'entrée » : stop à l'entrée à partir de la bougie qui suit les +InpSwBeAtR R
          if(bBeOn && !bBeOut && t > bBeBar && r[t].low <= bEntry) bBeOut = true;
          if(!bBeOn && t > bFill && bRisk > 0 && r[t].high >= bEntry + InpSwBeAtR * bRisk) { bBeOn = true; bBeBar = t; }
+         {
+          double cap = InpSwMaxTPR > 0 ? InpSwMaxTPR : 3.0;
+          double tp3 = MathMin(bTP, bEntry + cap * bRisk);
+          double lo5 = r[t].low;
+          for(int k = MathMax(0, t - 4); k <= t; k++) lo5 = MathMin(lo5, r[k].low);
+          for(int v = 0; v < 4; v++) SwVarStep(true, r[t], t == bFill, bEntry, bRisk, tp3, atr[t], lo5, v, bvS, bvE, bvR, bvP, bvD);
+         }
          bool hitSL = r[t].low <= bSL;
          bool hitTP = t > bFill && r[t].high >= bTP;
          if(t > bFill && !hitSL && bRisk > 0) bMfe = MathMax(bMfe, (r[t].high - bEntry) / bRisk);
@@ -2232,8 +2277,10 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
                double cost = (bRisk > 0) ? spr / bRisk : 0;
                double R = (hitSL ? -1.0 : bRR) - cost;
                double Rbe = bBeOut ? -cost : R;
-               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f;%.2f;%d;%.2f", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
-                                               hitSL ? "stop" : "objectif", R, Rbe, bFill - bStart, bMfe));   // v1.18 : délai d'entrée en bougies
+               QueuePushLocal(ev, StringFormat("RESULT;BUY;%s;%s;%.2f;%.2f;%d;%.2f;%.2f;%.2f;%.2f;%.2f", TimeToString(r[bStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R, Rbe, bFill - bStart, bMfe,
+                                               (bvD[0] ? bvR[0] : R + cost) - cost, (bvD[1] ? bvR[1] : R + cost) - cost,
+                                               (bvD[2] ? bvR[2] : R + cost) - cost, (bvD[3] ? bvR[3] : R + cost) - cost));   // v1.22 : variantes 0-3   // v1.18 : délai d'entrée en bougies
               }
             bState = 0;
            }
@@ -2260,6 +2307,7 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
          if(sValid && r[t].high >= sEntry)
            {
             sState = 2; sFill = t; sBeOn = false; sBeOut = false; sBeBar = -1; sMfe = 0;
+            for(int v = 0; v < 4; v++) { svS[v] = sSL; svE[v] = sEntry; svR[v] = 0; svP[v] = false; svD[v] = false; }
             if(t == last) Print("ORACLE : SAV-WS ", sym, " ", SwTfName(tf), " vente déclenchée à ", DoubleToString(sEntry, dg));
            }
          else if(r[t].low < sExt) { sExt = r[t].low; sEval = true; }
@@ -2296,6 +2344,13 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
          double sRisk = MathAbs(sSL - sEntry);
          if(sBeOn && !sBeOut && t > sBeBar && r[t].high >= sEntry) sBeOut = true;
          if(!sBeOn && t > sFill && sRisk > 0 && r[t].low <= sEntry - InpSwBeAtR * sRisk) { sBeOn = true; sBeBar = t; }
+         {
+          double cap = InpSwMaxTPR > 0 ? InpSwMaxTPR : 3.0;
+          double tp3 = MathMax(sTP, sEntry - cap * sRisk);
+          double hi5 = r[t].high;
+          for(int k = MathMax(0, t - 4); k <= t; k++) hi5 = MathMax(hi5, r[k].high);
+          for(int v = 0; v < 4; v++) SwVarStep(false, r[t], t == sFill, sEntry, sRisk, tp3, atr[t], hi5, v, svS, svE, svR, svP, svD);
+         }
          bool hitSL = r[t].high >= sSL;
          bool hitTP = t > sFill && r[t].low <= sTP;
          if(t > sFill && !hitSL && sRisk > 0) sMfe = MathMax(sMfe, (sEntry - r[t].low) / sRisk);
@@ -2307,8 +2362,10 @@ bool SwScan(string sym, ENUM_TIMEFRAMES tf, int bias, int srvOff, SwRes &res, st
                double cost = (sRisk > 0) ? spr / sRisk : 0;
                double R = (hitSL ? -1.0 : sRR) - cost;
                double Rbe = sBeOut ? -cost : R;
-               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f;%.2f;%d;%.2f", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
-                                               hitSL ? "stop" : "objectif", R, Rbe, sFill - sStart, sMfe));   // v1.18 : délai d'entrée en bougies
+               QueuePushLocal(ev, StringFormat("RESULT;SELL;%s;%s;%.2f;%.2f;%d;%.2f;%.2f;%.2f;%.2f;%.2f", TimeToString(r[sStart].time + PeriodSeconds(tf), TIME_DATE | TIME_MINUTES),
+                                               hitSL ? "stop" : "objectif", R, Rbe, sFill - sStart, sMfe,
+                                               (svD[0] ? svR[0] : R + cost) - cost, (svD[1] ? svR[1] : R + cost) - cost,
+                                               (svD[2] ? svR[2] : R + cost) - cost, (svD[3] ? svR[3] : R + cost) - cost));   // v1.22 : variantes 0-3   // v1.18 : délai d'entrée en bougies
               }
             sState = 0;
            }
@@ -2689,7 +2746,8 @@ void SwProcess(bool allowed)
                           {
                            SavJournal(StringFormat("SAVWS_RESULT;%I64d;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s;%s", AccountInfoInteger(ACCOUNT_LOGIN),
                                                    asset, sym, SwTfName(tf), f[1], f[2], f[3], f[4], SwModeNow() == 2 ? "SIM" : "OBS",
-                                                   nf >= 6 ? f[5] : f[4], nf >= 7 ? f[6] : "-", nf >= 8 ? f[7] : "-"));   // v1.19 : 13e champ = gain maximal en R   // v1.18 : 12e champ = délai d'entrée (bougies)
+                                                   nf >= 6 ? f[5] : f[4], nf >= 7 ? f[6] : "-", nf >= 8 ? f[7] : "-")
+                                      + (nf >= 12 ? ";" + f[8] + ";" + f[9] + ";" + f[10] + ";" + f[11] : ""));   // v1.22 : 14e-17e champs = variantes de sortie   // v1.19 : 13e champ = gain maximal en R   // v1.18 : 12e champ = délai d'entrée (bougies)
                            if(SwModeNow() == 1 && InpSwNotify)
                               Notify(StringFormat("SAV-WS %s %s %s (observation) : %s, %sR", SwTfName(tf), sym,
                                                   f[1] == "BUY" ? "achat" : "vente", f[3], f[4]));
