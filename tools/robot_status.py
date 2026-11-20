@@ -232,6 +232,8 @@ def _plan_issued():
     seen = {}
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if os.path.exists(os.path.join(root, ".git", "shallow")):   # clone partiel des tâches : récupérer l'historique des consignes
+            subprocess.run(["git", "-C", root, "fetch", "-q", "--unshallow"], capture_output=True, timeout=90)
         log = subprocess.run(["git", "-C", root, "log", "--reverse", "--format=@@%cI", "-p", "--", "oracle_signals.csv"],
                              capture_output=True, text=True, timeout=60).stdout
         when = ""
