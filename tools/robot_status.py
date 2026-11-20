@@ -3,7 +3,7 @@
 Lit les tickets GitHub n°1 (journal) et n°2 (signal de vie) du depot public.
 Usage : python3 robot_status.py [biais.json] > robot.json
 biais.json (optionnel) : liste [{"code","bias","date","why"}] lue dans le plan."""
-import json, sys, urllib.request, datetime, collections
+import json, os, sys, urllib.request, datetime, collections
 
 REPO = "ayaohsa-max/oracle-signals"
 
@@ -174,6 +174,18 @@ biases = []
 if len(sys.argv) > 1:
     try:
         biases = json.load(open(sys.argv[1], encoding="utf-8"))
+    except Exception:
+        pass
+if not biases:   # sinon : biais publiés dans les consignes du robot (oracle_signals.csv)
+    try:
+        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        _hd = ""
+        for _l in open(os.path.join(_root, "oracle_signals.csv"), encoding="utf-8"):
+            _f = _l.strip().split(";")
+            if _f[0] == "HEADER" and len(_f) > 1:
+                _hd = _f[1][8:10] + "/" + _f[1][5:7]
+            elif _f[0] == "BIAS" and len(_f) >= 3:
+                biases.append(dict(code=_f[1], bias=int(_f[2]), date=_hd, why="consignes du robot"))
     except Exception:
         pass
 def _stats(rs):
