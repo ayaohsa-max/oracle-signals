@@ -249,6 +249,13 @@ def _plan_issued():
     return seen
 _iss = _plan_issued()
 plan_ideas = []
+_cur = set()
+try:   # idées encore transmises au robot (lignes ORDER des consignes actuelles)
+    for _l in open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "oracle_signals.csv"), encoding="utf-8"):
+        if _l.startswith("ORDER;"):
+            _cur.add(_l.split(";")[1])
+except Exception:
+    pass
 for k in set(_iss) | set(plan_tr) | set(plan_open):
     x = dict(_iss.get(k, dict(id=k)))
     tr = plan_tr.get(k, [])
@@ -256,8 +263,10 @@ for k in set(_iss) | set(plan_tr) | set(plan_open):
         x["status"] = "clôturée"; x["r"] = round(sum(t["r"] for t in tr) / len(tr), 2)
     elif k in plan_open:
         x["status"] = "en cours"
-    else:
+    elif k in _cur:
         x["status"] = "non déclenchée"
+    else:
+        x["status"] = "retirée"          # plus dans les consignes (invalidée, expirée ou fermée)
     x["opened"] = plan_open.get(k)
     plan_ideas.append(x)
 plan_ideas.sort(key=lambda x: x.get("issued") or x.get("opened") or "", reverse=True)
