@@ -43,8 +43,8 @@
 //|         une série de pertes, sortie au choix (break-even / ATR). |
 //+------------------------------------------------------------------+
 #property copyright "ORACLE"
-#property version   "1.22"
-#define ORACLE_VERSION "1.22"
+#property version   "1.23"
+#define ORACLE_VERSION "1.23"
 #property description "Exécute les idées du plan ORACLE (ordres en attente). Fonctionne sur compte démo et réel."
 
 #include <Trade\Trade.mqh>
@@ -3032,6 +3032,7 @@ void Cycle()
 int OnInit()
   {
    g_tester = (bool)MQLInfoInteger(MQL_TESTER);
+   g_lastBeat = 0;   // v1.23 : signal de vie immédiat après un changement de réglages (les variables globales sont conservées)
    SwInitTFs();
    if(g_tester)
      {
