@@ -265,7 +265,12 @@ _pr = [x["r"] for x in plan_ideas if "r" in x]
 plan = dict(issued=len(_iss), triggered=sum(1 for x in plan_ideas if x["status"] != "non déclenchée"),
             real=_stats(_pr), ideas=plan_ideas[:25])
 events.sort(key=lambda e: e.get("time") or "", reverse=True)
-out = dict(events=events[:40], plan=plan, accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw, crypto_wk=crypto_wk,
+news = {}
+try:   # analyses news écrites par la tâche « ORACLE analyses news » (news/news.json)
+    news = json.load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "news", "news.json"), encoding="utf-8"))
+except Exception:
+    pass
+out = dict(news=news, events=events[:40], plan=plan, accounts=accounts, alerts=alerts, biases=biases, savws=savws, crypto_weekend=cw, crypto_wk=crypto_wk,
            sav=dict(mode=None, signals=list(reversed(sig))[:15], results=results),
            days=list(reversed(days))[:10])
 print(json.dumps(out, ensure_ascii=False))
