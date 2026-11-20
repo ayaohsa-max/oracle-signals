@@ -1,0 +1,197 @@
+{
+ "updated": "ven 20/11/2026 21:00 (Paris)",
+ "items": [
+  {
+   "id": "W05",
+   "sym": "NZDUSD",
+   "side": "SELL",
+   "time": "20/11 21:00",
+   "event": "La RBNZ maintient ses taux le 02/11 avec un ton jugé neutre, certains analystes estimant le cycle d'assouplissement terminé.",
+   "event_date": "02/11",
+   "source": "FXStreet / Forex.com",
+   "url": "https://www.fxstreet.com/news/new-zealand-dollar-loses-its-iran-talks-gain-after-rbnz-hold-202611022245",
+   "summary": "Le kiwi a effacé son gain lié aux pourparlers sur l'Iran après le statu quo de la RBNZ. Un ton neutre limite la baisse de la devise mais n'offre pas de moteur haussier clair pour l'actif.",
+   "points": [
+    {
+     "text": "RBNZ en statu quo le 02/11, le NZD perd son gain post-annonce",
+     "tag": "NEUTRE"
+    },
+    {
+     "text": "Lecture « fin du cycle de baisse » : soutien potentiel au NZD (forex.com)",
+     "tag": "HAUSSIER"
+    },
+    {
+     "text": "Rabobank évoque des vents contraires sur la croissance néo-zélandaise (02/11)",
+     "tag": "BAISSIER"
+    },
+    {
+     "text": "Biais du robot vendeur sur NZDUSD au 20/11",
+     "tag": "BAISSIER"
+    }
+   ],
+   "convergence": "La croissance néo-zélandaise jugée fragile et la dynamique vendeuse du robot vont dans le sens de la vente.",
+   "divergence": "Un virage neutre de la RBNZ et la fin présumée des baisses de taux peuvent alimenter un rebond du NZD.",
+   "verdict": "neutre"
+  },
+  {
+   "id": "T14",
+   "sym": "USDCAD",
+   "side": "BUY",
+   "time": "20/11 21:00",
+   "event": "Le pétrole a fortement reculé début novembre (Brent -18 % en une semaine au 05/11) ; FXStreet parle d'un « problème du pétrole » pour le dollar canadien (10/11).",
+   "event_date": "10/11",
+   "source": "FXStreet",
+   "url": "https://www.fxstreet.com/analysis/the-canadian-dollars-crude-problem-202611101842",
+   "summary": "Un brut plus faible pèse sur les termes de l'échange canadiens et sur le CAD, ce qui soutient un USDCAD acheteur. Le dollar américain reste par ailleurs soutenu par un repricing de la Fed jugé plus ferme.",
+   "points": [
+    {
+     "text": "Brent en recul de 18 % sur une semaine début novembre (Trump minimise de nouvelles frappes sur l'Iran)",
+     "tag": "HAUSSIER"
+    },
+    {
+     "text": "FXStreet (10/11) : le CAD reste dépendant du brut",
+     "tag": "HAUSSIER"
+    },
+    {
+     "text": "Repricing de la Fed plus ferme évoqué par investingLive sur le marché crypto",
+     "tag": "HAUSSIER"
+    },
+    {
+     "text": "Un rebond du pétrole en cas de tensions au Moyen-Orient soutiendrait le CAD",
+     "tag": "BAISSIER"
+    }
+   ],
+   "convergence": "Pétrole faible et dollar américain ferme jouent en faveur d'un USDCAD plus haut.",
+   "divergence": "Un retour de la prime de risque géopolitique sur le brut ferait remonter le CAD et pénaliserait l'achat.",
+   "verdict": "soutient le trade"
+  },
+  {
+   "id": "T13",
+   "sym": "BTCUSD",
+   "side": "SELL",
+   "time": "20/11 21:00",
+   "event": "Bitcoin en nette baisse en novembre : « pire novembre en 7 ans » selon Cointelegraph, repricing hawkish de la Fed.",
+   "event_date": "20/11",
+   "source": "Cointelegraph / investingLive",
+   "url": "https://cointelegraph.com/news/bitcoin-likely-on-track-worst-november-in-7-years-analysts",
+   "summary": "La faiblesse saisonnière et un repricing plus ferme de la Fed pèsent sur les cryptos, ce qui s'aligne avec une vente sur rebond. Des investisseurs institutionnels restent cependant acheteurs.",
+   "points": [
+    {
+     "text": "Novembre en passe d'être le pire depuis 7 ans selon des analystes",
+     "tag": "BAISSIER"
+    },
+    {
+     "text": "Repricing hawkish de la Fed : bitcoin consolide près de ses plus bas récents",
+     "tag": "BAISSIER"
+    },
+    {
+     "text": "Strategy défend la solidité de son bilan malgré le repli (Nasdaq)",
+     "tag": "NEUTRE"
+    },
+    {
+     "text": "Texas investit 5 M$ dans un trust bitcoin (TradingView)",
+     "tag": "HAUSSIER"
+    }
+   ],
+   "convergence": "Tendance baissière du mois et pression macro cohérentes avec une vente sur rebond.",
+   "divergence": "Achats institutionnels et un possible rebond technique pourraient invalider la zone d'entrée.",
+   "verdict": "soutient le trade"
+  },
+  {
+   "sym": "AUDUSD",
+   "side": "SELL",
+   "time": "20/11 21:00",
+   "event": "La RBA relève ses taux de 25 pb à 4,85 % le 03/11, hausse qualifiée de « dovish ».",
+   "event_date": "03/11",
+   "source": "FXStreet / Mitrade",
+   "url": "https://www.fxstreet.com/news/australian-dollar-declines-after-rba-hikes-rates-by-25-bps-to-485-202611030407",
+   "summary": "Malgré la hausse de taux, l'AUD a reculé après l'annonce, le ton étant jugé prudent. FXStreet (11/11) estime que le dollar australien perd son principal soutien.",
+   "points": [
+    {
+     "text": "RBA +25 pb à 4,85 % le 03/11, AUD en baisse après la décision",
+     "tag": "NEUTRE"
+    },
+    {
+     "text": "Ton « dovish » de la hausse : peu de visibilité sur d'autres relèvements",
+     "tag": "BAISSIER"
+    },
+    {
+     "text": "FXStreet 11/11 : l'AUD perd ce qui le soutenait",
+     "tag": "BAISSIER"
+    },
+    {
+     "text": "Un différentiel de taux favorable à l'AUD reste un soutien structurel",
+     "tag": "HAUSSIER"
+    }
+   ],
+   "convergence": "Ton prudent de la RBA et faiblesse post-annonce de l'AUD favorisent un scénario vendeur.",
+   "divergence": "Des taux directeurs en hausse peuvent attirer des flux acheteurs sur l'AUD si les données australiennes surprennent.",
+   "verdict": "soutient le trade",
+   "id": "T12"
+  },
+  {
+   "sym": "AUDUSD",
+   "side": "SELL",
+   "time": "20/11 21:00",
+   "event": "La RBA relève ses taux de 25 pb à 4,85 % le 03/11, hausse qualifiée de « dovish ».",
+   "event_date": "03/11",
+   "source": "FXStreet / Mitrade",
+   "url": "https://www.fxstreet.com/news/australian-dollar-declines-after-rba-hikes-rates-by-25-bps-to-485-202611030407",
+   "summary": "Malgré la hausse de taux, l'AUD a reculé après l'annonce, le ton étant jugé prudent. FXStreet (11/11) estime que le dollar australien perd son principal soutien.",
+   "points": [
+    {
+     "text": "RBA +25 pb à 4,85 % le 03/11, AUD en baisse après la décision",
+     "tag": "NEUTRE"
+    },
+    {
+     "text": "Ton « dovish » de la hausse : peu de visibilité sur d'autres relèvements",
+     "tag": "BAISSIER"
+    },
+    {
+     "text": "FXStreet 11/11 : l'AUD perd ce qui le soutenait",
+     "tag": "BAISSIER"
+    },
+    {
+     "text": "Un différentiel de taux favorable à l'AUD reste un soutien structurel",
+     "tag": "HAUSSIER"
+    }
+   ],
+   "convergence": "Ton prudent de la RBA et faiblesse post-annonce de l'AUD favorisent un scénario vendeur.",
+   "divergence": "Des taux directeurs en hausse peuvent attirer des flux acheteurs sur l'AUD si les données australiennes surprennent.",
+   "verdict": "soutient le trade",
+   "id": "T10"
+  },
+  {
+   "id": "T11",
+   "sym": "EURGBP",
+   "side": "SELL",
+   "time": "20/11 21:00",
+   "event": "La BoE relève ses taux à 4,00 % le 05/11 ; ING voit encore du potentiel de hausse de la livre face à l'euro (18/11).",
+   "event_date": "05/11",
+   "source": "Mitrade / ING",
+   "url": "https://www.mitrade.com/insights/news/live-news/article-1-2262716-20261118",
+   "summary": "Le resserrement de la BoE et l'analyse d'ING plaident pour une livre plus ferme contre euro, ce qui favorise une vente d'EURGBP. La paire est restée sans direction début novembre.",
+   "points": [
+    {
+     "text": "BoE +25 pb à 4,00 % le 05/11, GBP/EUR peu changé aussitôt après",
+     "tag": "NEUTRE"
+    },
+    {
+     "text": "ING (18/11) : marge de hausse supplémentaire pour la livre face à l'euro",
+     "tag": "BAISSIER"
+    },
+    {
+     "text": "EUR/GBP évolue dans une fourchette début novembre (FXStreet 09/11)",
+     "tag": "NEUTRE"
+    },
+    {
+     "text": "Ordre stop : déclenchement conditionné à une cassure, pas encore intervenue",
+     "tag": "NEUTRE"
+    }
+   ],
+   "convergence": "Politique BoE plus ferme et vue d'ING favorable à la livre soutiennent la vente.",
+   "divergence": "La paire reste en range et un euro soutenu par la BCE pourrait faire échouer la cassure.",
+   "verdict": "soutient le trade"
+  }
+ ]
+}
