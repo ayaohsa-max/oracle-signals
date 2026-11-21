@@ -5,7 +5,7 @@
 // Unités de temps : 5 min à 1 jour (profil ORACLE v1.20 : H1, UT supérieure H4, zone HTF obligatoire,
 //   3 confluences minimum, tendance de fond D1 vs moyenne 200 jours, objectif plafonné à 3 R,
 //   volatilité journalière ATR14/ATR100 entre 0,8 et 2,0 ; or réintégré le 18/11)
-// Version 1.2 (18/11/2026), alignée sur le robot ORACLE_Executor v1.20
+// Version 1.3 (21/11/2026), alignée sur le robot ORACLE_Executor v1.23 (objectif d'origine, plus de plafond à 3 R)
 // Fibo : 0 = extrême de l'impulsion, 1 = origine de l'impulsion
 // Entrée : 0.618 / 0.705 / 0.786 / 0.893 / 1 si confluences
 //   (OB, FVG, Sweep, MSS, Premium/Discount, Killzone, PDH/PDL/Asie, zone HTF)
@@ -69,7 +69,7 @@ htfTF    = input.timeframe("240", "Unité supérieure", group = G4)
 useAlign = input.bool(true, "Alignement EMA 20 > EMA 50 > SMA lente (inverse en vente)", group = G4)
 maLen    = input.int(200, "Période SMA lente", minval = 10, group = G4)
 useD1    = input.bool(true, "Tendance de fond obligatoire : clôture journalière vs moyenne 200 jours (robot v1.17)", group = G4)
-maxR     = input.float(3.0, "Objectif plafonné à n R (0 = objectif Fibo seul) — robot v1.20", minval = 0, step = 0.5, group = G4)
+maxR     = input.float(0.0, "Objectif plafonné à n R (0 = objectif Fibo seul, réglage du robot)", minval = 0, step = 0.5, group = G4)
 volMin   = input.float(0.8, "Volatilité minimale ATR14/ATR100 journalier (0 = pas de filtre) — robot v1.20", minval = 0, step = 0.1, group = G4)
 volMax   = input.float(2.0, "Volatilité maximale ATR14/ATR100 journalier (0 = pas de filtre)", minval = 0, step = 0.1, group = G4)
 useSess  = input.bool(false, "Trader seulement pendant la session", group = G4)

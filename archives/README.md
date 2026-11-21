@@ -38,6 +38,7 @@ Les versions 1.00 et 1.01 n'ont pas été publiées dans le dépôt.
 | Version | Date | Changements | Fichier |
 |---|---|---|---|
 | v1.1 | 17/11/2026 | Aligné sur le robot v1.17 : zone de l'unité supérieure obligatoire, 3 confluences minimum, tendance de fond D1 (moyenne 200 jours) | [code](indicateur/SAV-WS_v1.1.pine) |
+| v1.3 | 21/11/2026 | Aligné sur le robot v1.23 : objectif d'origine par défaut (plafond à n R = 0) | [code](indicateur/SAV-WS_v1.3.pine) |
 | v1.2 | 18/11/2026 | Aligné sur le robot v1.20 : objectif plafonné à 3 R, filtre de volatilité journalière 0,8-2,0 | [code](indicateur/SAV-WS_v1.2.pine) |
 | v1.0 | 13/11/2026 | Filtres SAV-AFS + entrée WinStructure (Fibo 0,618 à 1, confluences, 2 confluences minimum) | [code](indicateur/SAV-WS_v1.0.pine) |
 
